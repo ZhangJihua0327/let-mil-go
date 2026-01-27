@@ -1,0 +1,88 @@
+syntax = "proto3";
+
+package shard;
+
+option go_package = "github.com/let-mil-go/proto/shardpb";
+
+// ShardService provides KV operations on a shard.
+service ShardService {
+  // Put stores a key-value pair with automatic versioning.
+  rpc Put(PutRequest) returns (PutResponse);
+  
+  // PutWithVersion stores a key-value pair with a specific version.
+  rpc PutWithVersion(PutWithVersionRequest) returns (PutWithVersionResponse);
+  
+  // Get retrieves a value at a specific version.
+  rpc Get(GetRequest) returns (GetResponse);
+  
+  // GetLatest retrieves the latest value for a key.
+  rpc GetLatest(GetLatestRequest) returns (GetLatestResponse);
+  
+  // Delete marks a key as deleted with automatic versioning.
+  rpc Delete(DeleteRequest) returns (DeleteResponse);
+  
+  // DeleteWithVersion marks a key as deleted at a specific version.
+  rpc DeleteWithVersion(DeleteWithVersionRequest) returns (DeleteWithVersionResponse);
+  
+  // GetVersion returns the current version timestamp of the shard.
+  rpc GetVersion(GetVersionRequest) returns (GetVersionResponse);
+}
+
+message PutRequest {
+  string key = 1;
+  string value = 2;
+}
+
+message PutResponse {
+  uint64 version = 1;
+}
+
+message PutWithVersionRequest {
+  string key = 1;
+  string value = 2;
+  uint64 version = 3;
+}
+
+message PutWithVersionResponse {}
+
+message GetRequest {
+  string key = 1;
+  uint64 version = 2;
+}
+
+message GetResponse {
+  string value = 1;
+  uint64 version = 2;
+  bool found = 3;
+}
+
+message GetLatestRequest {
+  string key = 1;
+}
+
+message GetLatestResponse {
+  string value = 1;
+  uint64 version = 2;
+  bool found = 3;
+}
+
+message DeleteRequest {
+  string key = 1;
+}
+
+message DeleteResponse {
+  uint64 version = 1;
+}
+
+message DeleteWithVersionRequest {
+  string key = 1;
+  uint64 version = 2;
+}
+
+message DeleteWithVersionResponse {}
+
+message GetVersionRequest {}
+
+message GetVersionResponse {
+  uint64 version = 1;
+}
