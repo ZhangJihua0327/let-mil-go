@@ -88,9 +88,9 @@ func (s *Server) DeleteWithVersion(ctx context.Context, req *pb.DeleteWithVersio
 	return &pb.DeleteWithVersionResponse{}, nil
 }
 
-// GetVersion returns the current version timestamp of the shard.
+// GetVersion returns the current HLC timestamp of the shard.
 func (s *Server) GetVersion(ctx context.Context, req *pb.GetVersionRequest) (*pb.GetVersionResponse, error) {
-	return &pb.GetVersionResponse{Version: s.shard.CurrentVersion()}, nil
+	return &pb.GetVersionResponse{Version: s.shard.CurrentTime()}, nil
 }
 
 func (s *Server) convertError(err error) error {

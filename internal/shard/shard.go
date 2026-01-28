@@ -1,22 +1,24 @@
 package shard
 
 import (
-	"sync/atomic"
+	"github.com/let-mil-go/internal/common/hlc"
 )
 
 // Shard represents a single data shard in the distributed database.
 type Shard struct {
-	id        string
-	store     *MVCCStore
-	versionTS uint64
+	id    string
+	store *MVCCStore
+	clock *hlc.Clock
+	now   uint64
 }
 
 // NewShard creates a new shard with the given ID.
 func NewShard(id string) *Shard {
 	return &Shard{
-		id:        id,
-		store:     NewMVCCStore(),
-		versionTS: 0,
+		id:    id,
+		store: NewMVCCStore(),
+		clock: hlc.New(),
+		now:   uint64(0),
 	}
 }
 
@@ -25,29 +27,31 @@ func (s *Shard) ID() string {
 	return s.id
 }
 
-// NextVersion atomically increments and returns the next version timestamp.
-func (s *Shard) NextVersion() uint64 {
-	return atomic.AddUint64(&s.versionTS, 1)
+// Tick generates the next HLC timestamp.
+func (s *Shard) Tick() uint64 {
+	s.now = s.clock.Tick()
+	return s.now
 }
 
-// CurrentVersion returns the current version timestamp.
-func (s *Shard) CurrentVersion() uint64 {
-	return atomic.LoadUint64(&s.versionTS)
+// CurrentTime returns the current HLC timestamp.
+func (s *Shard) CurrentTime() uint64 {
+	return s.now
 }
 
-// SetVersion sets the version timestamp (used for synchronization).
-func (s *Shard) SetVersion(v uint64) {
-	atomic.StoreUint64(&s.versionTS, v)
+// Update updates the clock with an incoming timestamp.
+func (s *Shard) Update(incoming uint64) uint64 {
+	s.now = s.clock.Update(incoming)
+	return s.now
 }
 
-// Put stores a key-value pair with automatic versioning.
+// Put stores a key-value pair with automatic HLC timestamping.
 func (s *Shard) Put(key, value string) (uint64, error) {
-	version := s.NextVersion()
-	err := s.store.Put(key, value, version)
+	ts := s.Tick()
+	err := s.store.Put(key, value, ts)
 	if err != nil {
 		return 0, err
 	}
-	return version, nil
+	return ts, nil
 }
 
 // PutWithVersion stores a key-value pair with a specific version.
@@ -65,14 +69,14 @@ func (s *Shard) GetLatest(key string) (string, uint64, error) {
 	return s.store.GetLatest(key)
 }
 
-// Delete marks a key as deleted with automatic versioning.
+// Delete marks a key as deleted with automatic HLC timestamping.
 func (s *Shard) Delete(key string) (uint64, error) {
-	version := s.NextVersion()
-	err := s.store.Delete(key, version)
+	ts := s.clock.Tick()
+	err := s.store.Delete(key, ts)
 	if err != nil {
 		return 0, err
 	}
-	return version, nil
+	return ts, nil
 }
 
 // DeleteWithVersion marks a key as deleted at a specific version.
