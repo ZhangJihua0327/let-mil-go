@@ -3,6 +3,7 @@ package shard
 import (
 	"context"
 	"errors"
+
 	"github.com/let-mil-go/internal/shard/component"
 
 	"github.com/let-mil-go/internal/common/hlc"
@@ -149,23 +150,10 @@ func (s *Server) Prepare(ctx context.Context, req *pb.PrepareRequest) (*pb.Prepa
 	// Register transaction
 	s.txStatusTbl.Begin(req.TxId)
 
-	// Get or create buffer and merge write set from request
+	// Get buffer - must exist from previous TxRead/TxWrite/TxDelete calls
 	buf, ok := s.bufferMgr.Get(req.TxId)
 	if !ok {
 		return nil, status.Error(codes.NotFound, "transaction not found")
-	}
-
-	for _, op := range req.WriteSet {
-		if op.Deleted {
-			buf.PutDelete(op.Key, op.OriginalVersion)
-		} else {
-			buf.PutWrite(op.Key, op.Value, op.OriginalVersion)
-		}
-	}
-
-	// Merge read set from request
-	for _, r := range req.ReadSet {
-		buf.RecordRead(r.Key, r.Version, r.Found)
 	}
 
 	// Acquire write locks on all keys in write buffer

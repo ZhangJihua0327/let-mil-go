@@ -83,10 +83,8 @@ message ReadRecord {
 // 2PC Prepare
 message PrepareRequest {
   string tx_id = 1;
-  repeated WriteOp write_set = 2;     // Writes with original versions
-  repeated ReadRecord read_set = 3;   // Reads for SER validation
-  uint64 snapshot_time = 4;           // Snapshot time for validation
-  IsolationLevel isolation_level = 5; // Transaction isolation level
+  uint64 snapshot_time = 2;           // Snapshot time for validation
+  IsolationLevel isolation_level = 3; // Transaction isolation level
 }
 
 message PrepareResponse {
