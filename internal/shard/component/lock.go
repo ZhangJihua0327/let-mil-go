@@ -1,4 +1,4 @@
-package shard
+package component
 
 import (
 	"errors"
@@ -6,18 +6,18 @@ import (
 )
 
 var (
-	ErrLockConflict  = errors.New("lock conflict")
-	ErrLockNotHeld   = errors.New("lock not held by transaction")
-	ErrDeadlock      = errors.New("deadlock detected")
+	ErrLockConflict = errors.New("lock conflict")
+	ErrLockNotHeld  = errors.New("lock not held by transaction")
+	ErrDeadlock     = errors.New("deadlock detected")
 )
 
 // LockMode represents the type of lock.
 type LockMode int
 
 const (
-	LockNone LockMode = iota
-	LockRead          // Shared lock (S)
-	LockWrite         // Exclusive lock (X)
+	LockNone  LockMode = iota
+	LockRead           // Shared lock (S)
+	LockWrite          // Exclusive lock (X)
 )
 
 func (m LockMode) String() string {
@@ -42,8 +42,8 @@ type lockEntry struct {
 
 // LockManager manages key-level locks for transactions.
 type LockManager struct {
-	mu    sync.Mutex
-	locks map[string]*lockEntry // key -> lock entry
+	mu      sync.Mutex
+	locks   map[string]*lockEntry          // key -> lock entry
 	txLocks map[string]map[string]LockMode // txId -> key -> mode
 }
 

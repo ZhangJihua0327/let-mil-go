@@ -3,6 +3,7 @@ package shard
 import (
 	"context"
 	"errors"
+	"github.com/let-mil-go/internal/shard/component"
 
 	"github.com/let-mil-go/internal/common/hlc"
 	"github.com/let-mil-go/internal/model"
@@ -14,23 +15,23 @@ import (
 // Server implements the ShardService gRPC server.
 type Server struct {
 	pb.UnimplementedShardServiceServer
-	shard       *Shard
-	bufferMgr   *TxBufferManager
-	lockMgr     *LockManager
+	shard       *component.Shard
+	bufferMgr   *component.TxBufferManager
+	lockMgr     *component.LockManager
 	txStatusTbl *model.TxStatusTable
 	hlc         *hlc.Clock
-	oplog       OpLog
+	oplog       component.OpLog
 }
 
 // NewServer creates a new gRPC server for the given shard.
-func NewServer(shard *Shard) *Server {
+func NewServer(shard *component.Shard) *Server {
 	return &Server{
 		shard:       shard,
-		bufferMgr:   NewTxBufferManager(),
-		lockMgr:     NewLockManager(),
+		bufferMgr:   component.NewTxBufferManager(),
+		lockMgr:     component.NewLockManager(),
 		txStatusTbl: model.NewTxStatusTable(),
 		hlc:         hlc.GetClock(),
-		oplog:       NewNoOpLog(),
+		oplog:       component.NewNoOpLog(),
 	}
 }
 
@@ -67,7 +68,7 @@ func (s *Server) TxRead(ctx context.Context, req *pb.TxReadRequest) (*pb.TxReadR
 	// Read from store at snapshot time (external read)
 	value, version, _, err := s.shard.Get(req.Key, req.SnapshotTime)
 	if err != nil {
-		if errors.Is(err, ErrKeyNotFound) || errors.Is(err, ErrVersionNotFound) {
+		if errors.Is(err, component.ErrKeyNotFound) || errors.Is(err, component.ErrVersionNotFound) {
 			// Record external read even if not found (for SER validation)
 			buf.RecordRead(req.Key, 0, false)
 			return &pb.TxReadResponse{Found: false, Version: 0}, nil
@@ -77,12 +78,12 @@ func (s *Server) TxRead(ctx context.Context, req *pb.TxReadRequest) (*pb.TxReadR
 
 	// Record external read for SER isolation level validation
 	buf.RecordRead(req.Key, version, true)
-	s.oplog.Append(&OpEntry{
+	s.oplog.Append(&component.OpEntry{
 		Timestamp: s.hlcTick(),
 		TxId:      req.TxId,
 		Key:       req.Key,
 		Value:     value,
-		OpType:    OpTypeRead,
+		OpType:    component.OpTypeRead,
 	})
 
 	return &pb.TxReadResponse{
@@ -106,12 +107,12 @@ func (s *Server) TxWrite(ctx context.Context, req *pb.TxWriteRequest) (*pb.TxWri
 	// If key not found, originalVersion remains 0
 
 	buf.PutWrite(req.Key, req.Value, originalVersion)
-	s.oplog.Append(&OpEntry{
+	s.oplog.Append(&component.OpEntry{
 		Timestamp: s.hlcTick(),
 		TxId:      req.TxId,
 		Key:       req.Key,
 		Value:     req.Value,
-		OpType:    OpTypeWrite,
+		OpType:    component.OpTypeWrite,
 	})
 
 	return &pb.TxWriteResponse{OriginalVersion: originalVersion}, nil
@@ -131,12 +132,12 @@ func (s *Server) TxDelete(ctx context.Context, req *pb.TxDeleteRequest) (*pb.TxD
 	// If key not found, originalVersion remains 0
 
 	buf.PutDelete(req.Key, originalVersion)
-	s.oplog.Append(&OpEntry{
+	s.oplog.Append(&component.OpEntry{
 		Timestamp: s.hlcTick(),
 		TxId:      req.TxId,
 		Key:       req.Key,
 		Value:     "",
-		OpType:    OpTypeDelete,
+		OpType:    component.OpTypeDelete,
 	})
 	return &pb.TxDeleteResponse{OriginalVersion: originalVersion}, nil
 }
@@ -149,7 +150,10 @@ func (s *Server) Prepare(ctx context.Context, req *pb.PrepareRequest) (*pb.Prepa
 	s.txStatusTbl.Begin(req.TxId)
 
 	// Get or create buffer and merge write set from request
-	buf := s.bufferMgr.GetOrCreate(req.TxId)
+	buf, ok := s.bufferMgr.Get(req.TxId)
+	if !ok {
+		return nil, status.Error(codes.NotFound, "transaction not found")
+	}
 	for _, op := range req.WriteSet {
 		if op.Deleted {
 			buf.PutDelete(op.Key, op.OriginalVersion)
@@ -273,12 +277,12 @@ func (s *Server) Commit(ctx context.Context, req *pb.CommitRequest) (*pb.CommitR
 	s.lockMgr.Release(req.TxId)
 	s.bufferMgr.Remove(req.TxId)
 	s.txStatusTbl.Commit(req.TxId)
-	s.oplog.Append(&OpEntry{
+	s.oplog.Append(&component.OpEntry{
 		Timestamp: req.CommitTime,
 		TxId:      req.TxId,
 		Key:       "",
 		Value:     "",
-		OpType:    OpTypeCommit,
+		OpType:    component.OpTypeCommit,
 	})
 
 	return &pb.CommitResponse{}, nil
@@ -289,12 +293,12 @@ func (s *Server) Abort(ctx context.Context, req *pb.AbortRequest) (*pb.AbortResp
 	s.lockMgr.Release(req.TxId)
 	s.bufferMgr.Remove(req.TxId)
 	s.txStatusTbl.Abort(req.TxId)
-	s.oplog.Append(&OpEntry{
+	s.oplog.Append(&component.OpEntry{
 		Timestamp: s.hlcTick(),
 		TxId:      req.TxId,
 		Key:       "",
 		Value:     "",
-		OpType:    OpTypeAbort,
+		OpType:    component.OpTypeAbort,
 	})
 	return &pb.AbortResponse{}, nil
 }
@@ -306,13 +310,13 @@ func (s *Server) GetCurrentTime(ctx context.Context, req *pb.GetCurrentTimeReque
 
 func (s *Server) convertError(err error) error {
 	switch {
-	case errors.Is(err, ErrKeyNotFound):
+	case errors.Is(err, component.ErrKeyNotFound):
 		return status.Error(codes.NotFound, err.Error())
-	case errors.Is(err, ErrVersionNotFound):
+	case errors.Is(err, component.ErrVersionNotFound):
 		return status.Error(codes.NotFound, err.Error())
-	case errors.Is(err, ErrVersionConflict):
+	case errors.Is(err, component.ErrVersionConflict):
 		return status.Error(codes.AlreadyExists, err.Error())
-	case errors.Is(err, ErrLockConflict):
+	case errors.Is(err, component.ErrLockConflict):
 		return status.Error(codes.Aborted, err.Error())
 	default:
 		return status.Error(codes.Internal, err.Error())

@@ -1,4 +1,4 @@
-package shard
+package component
 
 import (
 	"github.com/let-mil-go/internal/common/hlc"

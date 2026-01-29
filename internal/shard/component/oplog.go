@@ -1,4 +1,4 @@
-package shard
+package component
 
 // OpType represents the type of operation in the oplog.
 type OpType int

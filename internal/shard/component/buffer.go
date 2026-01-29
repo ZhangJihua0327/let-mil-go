@@ -1,4 +1,4 @@
-package shard
+package component
 
 import (
 	"sync"
@@ -21,10 +21,10 @@ type ReadRecord struct {
 
 // TxBuffer stores pending writes and read records for a single transaction.
 type TxBuffer struct {
-	txId      string
-	writes    map[string]*WriteOp   // key -> latest write op
-	writeOrder []string             // insertion order for deterministic apply
-	reads     map[string]*ReadRecord // key -> read record (external reads only)
+	txId       string
+	writes     map[string]*WriteOp    // key -> latest write op
+	writeOrder []string               // insertion order for deterministic apply
+	reads      map[string]*ReadRecord // key -> read record (external reads only)
 }
 
 // NewTxBuffer creates a new transaction buffer.
