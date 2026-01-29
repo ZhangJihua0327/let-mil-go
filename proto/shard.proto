@@ -4,85 +4,95 @@ package shard;
 
 option go_package = "github.com/let-mil-go/proto/shardpb";
 
-// ShardService provides KV operations on a shard.
+// ShardService provides transactional KV operations on a shard.
 service ShardService {
-  // Put stores a key-value pair with automatic versioning.
-  rpc Put(PutRequest) returns (PutResponse);
-  
-  // PutWithVersion stores a key-value pair with a specific version.
-  rpc PutWithVersion(PutWithVersionRequest) returns (PutWithVersionResponse);
-  
-  // Get retrieves a value at a specific version.
-  rpc Get(GetRequest) returns (GetResponse);
-  
-  // GetLatest retrieves the latest value for a key.
-  rpc GetLatest(GetLatestRequest) returns (GetLatestResponse);
-  
-  // Delete marks a key as deleted with automatic versioning.
-  rpc Delete(DeleteRequest) returns (DeleteResponse);
-  
-  // DeleteWithVersion marks a key as deleted at a specific version.
-  rpc DeleteWithVersion(DeleteWithVersionRequest) returns (DeleteWithVersionResponse);
-  
-  // GetVersion returns the current version timestamp of the shard.
-  rpc GetVersion(GetVersionRequest) returns (GetVersionResponse);
+  // Transaction operations (buffered until commit)
+  rpc TxRead(TxReadRequest) returns (TxReadResponse);
+  rpc TxWrite(TxWriteRequest) returns (TxWriteResponse);
+  rpc TxDelete(TxDeleteRequest) returns (TxDeleteResponse);
+
+  // 2PC protocol
+  rpc Prepare(PrepareRequest) returns (PrepareResponse);
+  rpc Commit(CommitRequest) returns (CommitResponse);
+  rpc Abort(AbortRequest) returns (AbortResponse);
+
+  // Shard metadata
+  rpc GetCurrentTime(GetCurrentTimeRequest) returns (GetCurrentTimeResponse);
 }
 
-message PutRequest {
-  string key = 1;
-  string value = 2;
+// Transaction Read
+message TxReadRequest {
+  string tx_id = 1;
+  string key = 2;
+  uint64 snapshot_time = 3;  // HLC timestamp for snapshot read
 }
 
-message PutResponse {
-  uint64 version = 1;
-}
-
-message PutWithVersionRequest {
-  string key = 1;
-  string value = 2;
-  uint64 version = 3;
-}
-
-message PutWithVersionResponse {}
-
-message GetRequest {
-  string key = 1;
-  uint64 version = 2;
-}
-
-message GetResponse {
+message TxReadResponse {
   string value = 1;
   uint64 version = 2;
   bool found = 3;
 }
 
-message GetLatestRequest {
+// Transaction Write (buffered)
+message TxWriteRequest {
+  string tx_id = 1;
+  string key = 2;
+  string value = 3;
+}
+
+message TxWriteResponse {}
+
+// Transaction Delete (buffered)
+message TxDeleteRequest {
+  string tx_id = 1;
+  string key = 2;
+}
+
+message TxDeleteResponse {}
+
+// 2PC Prepare
+message PrepareRequest {
+  string tx_id = 1;
+  repeated WriteOp write_buffer = 2;  // Writes to prepare
+  repeated string check_set = 3;       // Keys to check for conflicts
+  uint64 snapshot_time = 4;            // Snapshot time for validation
+}
+
+message WriteOp {
   string key = 1;
+  string value = 2;
+  bool deleted = 3;
 }
 
-message GetLatestResponse {
-  string value = 1;
-  uint64 version = 2;
-  bool found = 3;
+message PrepareResponse {
+  Vote vote = 1;
+  uint64 prepare_time = 2;  // HLC timestamp when prepared
 }
 
-message DeleteRequest {
-  string key = 1;
+enum Vote {
+  VOTE_UNKNOWN = 0;
+  VOTE_COMMIT = 1;
+  VOTE_ABORT = 2;
 }
 
-message DeleteResponse {
-  uint64 version = 1;
+// 2PC Commit
+message CommitRequest {
+  string tx_id = 1;
+  uint64 commit_time = 2;  // Final commit HLC timestamp
 }
 
-message DeleteWithVersionRequest {
-  string key = 1;
-  uint64 version = 2;
+message CommitResponse {}
+
+// 2PC Abort
+message AbortRequest {
+  string tx_id = 1;
 }
 
-message DeleteWithVersionResponse {}
+message AbortResponse {}
 
-message GetVersionRequest {}
+// Shard current time
+message GetCurrentTimeRequest {}
 
-message GetVersionResponse {
-  uint64 version = 1;
+message GetCurrentTimeResponse {
+  uint64 time = 1;  // Current HLC timestamp
 }
