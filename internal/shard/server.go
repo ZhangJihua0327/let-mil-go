@@ -48,7 +48,7 @@ func (s *Server) TxRead(ctx context.Context, req *pb.TxReadRequest) (*pb.TxReadR
 	}
 
 	// Read from store at snapshot time (external read)
-	value, version, err := s.shard.Get(req.Key, req.SnapshotTime)
+	value, version, _, err := s.shard.Get(req.Key, req.SnapshotTime)
 	if err != nil {
 		if errors.Is(err, ErrKeyNotFound) || errors.Is(err, ErrVersionNotFound) {
 			// Record external read even if not found (for SER validation)
@@ -75,7 +75,7 @@ func (s *Server) TxWrite(ctx context.Context, req *pb.TxWriteRequest) (*pb.TxWri
 
 	// Get original version of the key (for CAS validation on commit)
 	var originalVersion uint64 = 0
-	_, version, err := s.shard.GetLatest(req.Key)
+	_, version, _, err := s.shard.GetLatest(req.Key)
 	if err == nil {
 		originalVersion = version
 	}
@@ -92,7 +92,7 @@ func (s *Server) TxDelete(ctx context.Context, req *pb.TxDeleteRequest) (*pb.TxD
 
 	// Get original version of the key (for CAS validation on commit)
 	var originalVersion uint64 = 0
-	_, version, err := s.shard.GetLatest(req.Key)
+	_, version, _, err := s.shard.GetLatest(req.Key)
 	if err == nil {
 		originalVersion = version
 	}
@@ -143,7 +143,7 @@ func (s *Server) Prepare(ctx context.Context, req *pb.PrepareRequest) (*pb.Prepa
 	// For SI and SER: Check that write set keys haven't been modified
 	if isoLevel == pb.IsolationLevel_ISOLATION_SI || isoLevel == pb.IsolationLevel_ISOLATION_SER {
 		for _, op := range buf.WriteOps() {
-			_, currentVersion, err := s.shard.GetLatest(op.Key)
+			_, currentVersion, _, err := s.shard.GetLatest(op.Key)
 			if err != nil {
 				// Key not found - original version should be 0
 				if op.OriginalVersion != 0 {
@@ -169,7 +169,7 @@ func (s *Server) Prepare(ctx context.Context, req *pb.PrepareRequest) (*pb.Prepa
 	// For SER: Additionally check that read set keys haven't been modified
 	if isoLevel == pb.IsolationLevel_ISOLATION_SER {
 		for _, r := range buf.ReadRecords() {
-			_, currentVersion, err := s.shard.GetLatest(r.Key)
+			_, currentVersion, _, err := s.shard.GetLatest(r.Key)
 			if err != nil {
 				// Key not found now
 				if r.Found {
@@ -218,12 +218,12 @@ func (s *Server) Commit(ctx context.Context, req *pb.CommitRequest) (*pb.CommitR
 		return nil, status.Error(codes.NotFound, "transaction not found")
 	}
 
-	// Apply all buffered writes with commit timestamp
+	// Apply all buffered writes with commit timestamp and transaction ID
 	for _, op := range buf.WriteOps() {
 		if op.Deleted {
-			s.shard.DeleteWithVersion(op.Key, req.CommitTime)
+			s.shard.Delete(op.Key, req.CommitTime, req.TxId)
 		} else {
-			s.shard.PutWithVersion(op.Key, op.Value, req.CommitTime)
+			s.shard.Put(op.Key, op.Value, req.CommitTime, req.TxId)
 		}
 	}
 

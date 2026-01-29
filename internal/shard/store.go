@@ -16,6 +16,7 @@ type VersionedValue struct {
 	Value   string
 	Version uint64
 	Deleted bool
+	TxId    string // Transaction ID that created this version
 }
 
 // MVCCStore is a multi-version concurrency control store.
@@ -34,7 +35,7 @@ func NewMVCCStore() *MVCCStore {
 
 // Put inserts or updates a key-value pair at the specified version.
 // If the version already exists, returns ErrVersionConflict.
-func (s *MVCCStore) Put(key, value string, version uint64) error {
+func (s *MVCCStore) Put(key, value string, version uint64, txId string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -49,6 +50,7 @@ func (s *MVCCStore) Put(key, value string, version uint64) error {
 		Value:   value,
 		Version: version,
 		Deleted: false,
+		TxId:    txId,
 	}
 
 	// Insert at correct position to maintain sorted order
@@ -61,54 +63,54 @@ func (s *MVCCStore) Put(key, value string, version uint64) error {
 }
 
 // Get retrieves the value for a key at the specified version.
-// Returns the latest version <= requested version.
-func (s *MVCCStore) Get(key string, version uint64) (string, uint64, error) {
+// Returns the latest version <= requested version, along with version and txId.
+func (s *MVCCStore) Get(key string, version uint64) (string, uint64, string, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
 	versions, ok := s.data[key]
 	if !ok || len(versions) == 0 {
-		return "", 0, ErrKeyNotFound
+		return "", 0, "", ErrKeyNotFound
 	}
 
 	// Find the latest version <= requested version
 	idx := s.findVersionIndex(versions, version+1) - 1
 	if idx < 0 {
-		return "", 0, ErrVersionNotFound
+		return "", 0, "", ErrVersionNotFound
 	}
 
 	vv := versions[idx]
 	if vv.Deleted {
-		return "", 0, ErrKeyNotFound
+		return "", 0, "", ErrKeyNotFound
 	}
 
-	return vv.Value, vv.Version, nil
+	return vv.Value, vv.Version, vv.TxId, nil
 }
 
 // GetExact retrieves the value for a key at exactly the specified version.
-func (s *MVCCStore) GetExact(key string, version uint64) (string, error) {
+func (s *MVCCStore) GetExact(key string, version uint64) (string, string, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
 	versions, ok := s.data[key]
 	if !ok {
-		return "", ErrKeyNotFound
+		return "", "", ErrKeyNotFound
 	}
 
 	idx := s.findVersionIndex(versions, version)
 	if idx >= len(versions) || versions[idx].Version != version {
-		return "", ErrVersionNotFound
+		return "", "", ErrVersionNotFound
 	}
 
 	if versions[idx].Deleted {
-		return "", ErrKeyNotFound
+		return "", "", ErrKeyNotFound
 	}
 
-	return versions[idx].Value, nil
+	return versions[idx].Value, versions[idx].TxId, nil
 }
 
 // Delete marks a key as deleted at the specified version.
-func (s *MVCCStore) Delete(key string, version uint64) error {
+func (s *MVCCStore) Delete(key string, version uint64, txId string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -123,6 +125,7 @@ func (s *MVCCStore) Delete(key string, version uint64) error {
 		Value:   "",
 		Version: version,
 		Deleted: true,
+		TxId:    txId,
 	}
 
 	versions = append(versions, VersionedValue{})
@@ -134,21 +137,22 @@ func (s *MVCCStore) Delete(key string, version uint64) error {
 }
 
 // GetLatest retrieves the latest value for a key.
-func (s *MVCCStore) GetLatest(key string) (string, uint64, error) {
+// Returns value, version, txId, and error.
+func (s *MVCCStore) GetLatest(key string) (string, uint64, string, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
 	versions, ok := s.data[key]
 	if !ok || len(versions) == 0 {
-		return "", 0, ErrKeyNotFound
+		return "", 0, "", ErrKeyNotFound
 	}
 
 	latest := versions[len(versions)-1]
 	if latest.Deleted {
-		return "", 0, ErrKeyNotFound
+		return "", 0, "", ErrKeyNotFound
 	}
 
-	return latest.Value, latest.Version, nil
+	return latest.Value, latest.Version, latest.TxId, nil
 }
 
 // GetAllVersions returns all versions for a key.

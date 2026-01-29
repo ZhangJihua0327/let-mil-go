@@ -44,44 +44,46 @@ func (s *Shard) Update(incoming uint64) uint64 {
 	return s.now
 }
 
-// Put stores a key-value pair with automatic HLC timestamping.
-func (s *Shard) Put(key, value string) (uint64, error) {
+// PutAuto stores a key-value pair with automatic HLC timestamping (no txId).
+func (s *Shard) PutAuto(key, value string) (uint64, error) {
 	ts := s.Tick()
-	err := s.store.Put(key, value, ts)
+	err := s.store.Put(key, value, ts, "")
 	if err != nil {
 		return 0, err
 	}
 	return ts, nil
 }
 
-// PutWithVersion stores a key-value pair with a specific version.
-func (s *Shard) PutWithVersion(key, value string, version uint64) error {
-	return s.store.Put(key, value, version)
+// Put stores a key-value pair with a specific version and transaction ID.
+func (s *Shard) Put(key, value string, version uint64, txId string) error {
+	return s.store.Put(key, value, version, txId)
 }
 
 // Get retrieves the value for a key at the specified version.
-func (s *Shard) Get(key string, version uint64) (string, uint64, error) {
+// Returns value, version, txId, and error.
+func (s *Shard) Get(key string, version uint64) (string, uint64, string, error) {
 	return s.store.Get(key, version)
 }
 
 // GetLatest retrieves the latest value for a key.
-func (s *Shard) GetLatest(key string) (string, uint64, error) {
+// Returns value, version, txId, and error.
+func (s *Shard) GetLatest(key string) (string, uint64, string, error) {
 	return s.store.GetLatest(key)
 }
 
-// Delete marks a key as deleted with automatic HLC timestamping.
-func (s *Shard) Delete(key string) (uint64, error) {
+// DeleteAuto marks a key as deleted with automatic HLC timestamping (no txId).
+func (s *Shard) DeleteAuto(key string) (uint64, error) {
 	ts := s.clock.Tick()
-	err := s.store.Delete(key, ts)
+	err := s.store.Delete(key, ts, "")
 	if err != nil {
 		return 0, err
 	}
 	return ts, nil
 }
 
-// DeleteWithVersion marks a key as deleted at a specific version.
-func (s *Shard) DeleteWithVersion(key string, version uint64) error {
-	return s.store.Delete(key, version)
+// Delete marks a key as deleted at a specific version with transaction ID.
+func (s *Shard) Delete(key string, version uint64, txId string) error {
+	return s.store.Delete(key, version, txId)
 }
 
 // GC performs garbage collection on versions older than minVersion.
