@@ -17,7 +17,6 @@ func NewShard(id string) *Shard {
 	return &Shard{
 		id:    id,
 		store: NewMVCCStore(),
-		clock: hlc.New(),
 		now:   uint64(0),
 	}
 }
@@ -25,33 +24,6 @@ func NewShard(id string) *Shard {
 // ID returns the shard identifier.
 func (s *Shard) ID() string {
 	return s.id
-}
-
-// Tick generates the next HLC timestamp.
-func (s *Shard) Tick() uint64 {
-	s.now = s.clock.Tick()
-	return s.now
-}
-
-// CurrentTime returns the current HLC timestamp.
-func (s *Shard) CurrentTime() uint64 {
-	return s.now
-}
-
-// Update updates the clock with an incoming timestamp.
-func (s *Shard) Update(incoming uint64) uint64 {
-	s.now = s.clock.Update(incoming)
-	return s.now
-}
-
-// PutAuto stores a key-value pair with automatic HLC timestamping (no txId).
-func (s *Shard) PutAuto(key, value string) (uint64, error) {
-	ts := s.Tick()
-	err := s.store.Put(key, value, ts, "")
-	if err != nil {
-		return 0, err
-	}
-	return ts, nil
 }
 
 // Put stores a key-value pair with a specific version and transaction ID.
@@ -69,16 +41,6 @@ func (s *Shard) Get(key string, version uint64) (string, uint64, string, error) 
 // Returns value, version, txId, and error.
 func (s *Shard) GetLatest(key string) (string, uint64, string, error) {
 	return s.store.GetLatest(key)
-}
-
-// DeleteAuto marks a key as deleted with automatic HLC timestamping (no txId).
-func (s *Shard) DeleteAuto(key string) (uint64, error) {
-	ts := s.clock.Tick()
-	err := s.store.Delete(key, ts, "")
-	if err != nil {
-		return 0, err
-	}
-	return ts, nil
 }
 
 // Delete marks a key as deleted at a specific version with transaction ID.

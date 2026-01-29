@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 
+	"github.com/let-mil-go/internal/common/hlc"
 	"github.com/let-mil-go/internal/model"
 	pb "github.com/let-mil-go/proto/shardpb"
 	"google.golang.org/grpc/codes"
@@ -17,6 +18,8 @@ type Server struct {
 	bufferMgr   *TxBufferManager
 	lockMgr     *LockManager
 	txStatusTbl *model.TxStatusTable
+	hlc         *hlc.Clock
+	oplog       OpLog
 }
 
 // NewServer creates a new gRPC server for the given shard.
@@ -26,7 +29,21 @@ func NewServer(shard *Shard) *Server {
 		bufferMgr:   NewTxBufferManager(),
 		lockMgr:     NewLockManager(),
 		txStatusTbl: model.NewTxStatusTable(),
+		hlc:         hlc.GetClock(),
+		oplog:       NewNoOpLog(),
 	}
+}
+
+func (s *Server) hlcTick() uint64 {
+	return s.hlc.Tick()
+}
+
+func (s *Server) hlcUpdate(now uint64) uint64 {
+	return s.hlc.Update(now)
+}
+
+func (s *Server) hlcNow() uint64 {
+	return s.hlc.Now()
 }
 
 // TxRead reads a value within a transaction context.
@@ -60,6 +77,13 @@ func (s *Server) TxRead(ctx context.Context, req *pb.TxReadRequest) (*pb.TxReadR
 
 	// Record external read for SER isolation level validation
 	buf.RecordRead(req.Key, version, true)
+	s.oplog.Append(&OpEntry{
+		Timestamp: s.hlcTick(),
+		TxId:      req.TxId,
+		Key:       req.Key,
+		Value:     value,
+		OpType:    OpTypeRead,
+	})
 
 	return &pb.TxReadResponse{
 		Value:   value,
@@ -82,6 +106,14 @@ func (s *Server) TxWrite(ctx context.Context, req *pb.TxWriteRequest) (*pb.TxWri
 	// If key not found, originalVersion remains 0
 
 	buf.PutWrite(req.Key, req.Value, originalVersion)
+	s.oplog.Append(&OpEntry{
+		Timestamp: s.hlcTick(),
+		TxId:      req.TxId,
+		Key:       req.Key,
+		Value:     req.Value,
+		OpType:    OpTypeWrite,
+	})
+
 	return &pb.TxWriteResponse{OriginalVersion: originalVersion}, nil
 }
 
@@ -99,6 +131,13 @@ func (s *Server) TxDelete(ctx context.Context, req *pb.TxDeleteRequest) (*pb.TxD
 	// If key not found, originalVersion remains 0
 
 	buf.PutDelete(req.Key, originalVersion)
+	s.oplog.Append(&OpEntry{
+		Timestamp: s.hlcTick(),
+		TxId:      req.TxId,
+		Key:       req.Key,
+		Value:     "",
+		OpType:    OpTypeDelete,
+	})
 	return &pb.TxDeleteResponse{OriginalVersion: originalVersion}, nil
 }
 
@@ -202,7 +241,7 @@ func (s *Server) Prepare(ctx context.Context, req *pb.PrepareRequest) (*pb.Prepa
 	}
 
 	// Generate prepare timestamp
-	prepareTime := s.shard.Tick()
+	prepareTime := s.hlcTick()
 	s.txStatusTbl.Prepare(req.TxId, prepareTime)
 
 	return &pb.PrepareResponse{
@@ -228,12 +267,19 @@ func (s *Server) Commit(ctx context.Context, req *pb.CommitRequest) (*pb.CommitR
 	}
 
 	// Update HLC with commit time
-	s.shard.Update(req.CommitTime)
+	s.hlc.Update(req.CommitTime)
 
 	// Cleanup
 	s.lockMgr.Release(req.TxId)
 	s.bufferMgr.Remove(req.TxId)
 	s.txStatusTbl.Commit(req.TxId)
+	s.oplog.Append(&OpEntry{
+		Timestamp: req.CommitTime,
+		TxId:      req.TxId,
+		Key:       "",
+		Value:     "",
+		OpType:    OpTypeCommit,
+	})
 
 	return &pb.CommitResponse{}, nil
 }
@@ -243,12 +289,19 @@ func (s *Server) Abort(ctx context.Context, req *pb.AbortRequest) (*pb.AbortResp
 	s.lockMgr.Release(req.TxId)
 	s.bufferMgr.Remove(req.TxId)
 	s.txStatusTbl.Abort(req.TxId)
+	s.oplog.Append(&OpEntry{
+		Timestamp: s.hlcTick(),
+		TxId:      req.TxId,
+		Key:       "",
+		Value:     "",
+		OpType:    OpTypeAbort,
+	})
 	return &pb.AbortResponse{}, nil
 }
 
 // GetCurrentTime returns the current HLC timestamp of the shard.
 func (s *Server) GetCurrentTime(ctx context.Context, req *pb.GetCurrentTimeRequest) (*pb.GetCurrentTimeResponse, error) {
-	return &pb.GetCurrentTimeResponse{Time: s.shard.CurrentTime()}, nil
+	return &pb.GetCurrentTimeResponse{Time: s.hlc.Now()}, nil
 }
 
 func (s *Server) convertError(err error) error {

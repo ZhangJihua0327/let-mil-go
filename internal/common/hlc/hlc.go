@@ -21,11 +21,18 @@ type Clock struct {
 	nowFn func() uint64
 }
 
-// New creates a new HLC clock.
-func New() *Clock {
-	return &Clock{
-		nowFn: physicalNow,
+var lock = &sync.Mutex{}
+var singleton *Clock
+
+func GetClock() *Clock {
+	if singleton == nil {
+		lock.Lock()
+		defer lock.Unlock()
+		if singleton == nil {
+			singleton = NewWithNowFn(physicalNow)
+		}
 	}
+	return singleton
 }
 
 // NewWithNowFn creates a new HLC clock with a custom time source (for testing).
