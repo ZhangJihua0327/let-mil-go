@@ -154,6 +154,7 @@ func (s *Server) Prepare(ctx context.Context, req *pb.PrepareRequest) (*pb.Prepa
 	if !ok {
 		return nil, status.Error(codes.NotFound, "transaction not found")
 	}
+
 	for _, op := range req.WriteSet {
 		if op.Deleted {
 			buf.PutDelete(op.Key, op.OriginalVersion)
