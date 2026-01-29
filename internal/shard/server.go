@@ -14,7 +14,7 @@ import (
 type Server struct {
 	pb.UnimplementedShardServiceServer
 	shard       *Shard
-	bufferMgr   *WriteBufferManager
+	bufferMgr   *TxBufferManager
 	lockMgr     *LockManager
 	txStatusTbl *model.TxStatusTable
 }
@@ -23,35 +23,43 @@ type Server struct {
 func NewServer(shard *Shard) *Server {
 	return &Server{
 		shard:       shard,
-		bufferMgr:   NewWriteBufferManager(),
+		bufferMgr:   NewTxBufferManager(),
 		lockMgr:     NewLockManager(),
 		txStatusTbl: model.NewTxStatusTable(),
 	}
 }
 
 // TxRead reads a value within a transaction context.
+// External reads are recorded in the buffer for SER isolation level validation.
 func (s *Server) TxRead(ctx context.Context, req *pb.TxReadRequest) (*pb.TxReadResponse, error) {
+	buf := s.bufferMgr.GetOrCreate(req.TxId)
+
 	// Check write buffer first (read-your-writes)
-	if buf, ok := s.bufferMgr.Get(req.TxId); ok {
-		if op, found := buf.Get(req.Key); found {
-			if op.Deleted {
-				return &pb.TxReadResponse{Found: false}, nil
-			}
-			return &pb.TxReadResponse{
-				Value: op.Value,
-				Found: true,
-			}, nil
+	// Internal reads don't need version tracking
+	if op, found := buf.GetWrite(req.Key); found {
+		if op.Deleted {
+			return &pb.TxReadResponse{Found: false, Version: 0}, nil
 		}
+		return &pb.TxReadResponse{
+			Value:   op.Value,
+			Version: op.OriginalVersion, // Return original version for internal consistency
+			Found:   true,
+		}, nil
 	}
 
-	// Read from store at snapshot time
+	// Read from store at snapshot time (external read)
 	value, version, err := s.shard.Get(req.Key, req.SnapshotTime)
 	if err != nil {
 		if errors.Is(err, ErrKeyNotFound) || errors.Is(err, ErrVersionNotFound) {
-			return &pb.TxReadResponse{Found: false}, nil
+			// Record external read even if not found (for SER validation)
+			buf.RecordRead(req.Key, 0, false)
+			return &pb.TxReadResponse{Found: false, Version: 0}, nil
 		}
 		return nil, s.convertError(err)
 	}
+
+	// Record external read for SER isolation level validation
+	buf.RecordRead(req.Key, version, true)
 
 	return &pb.TxReadResponse{
 		Value:   value,
@@ -61,36 +69,63 @@ func (s *Server) TxRead(ctx context.Context, req *pb.TxReadRequest) (*pb.TxReadR
 }
 
 // TxWrite buffers a write operation for a transaction.
+// Returns the original version of the key before this write.
 func (s *Server) TxWrite(ctx context.Context, req *pb.TxWriteRequest) (*pb.TxWriteResponse, error) {
 	buf := s.bufferMgr.GetOrCreate(req.TxId)
-	buf.Put(req.Key, req.Value)
-	return &pb.TxWriteResponse{}, nil
+
+	// Get original version of the key (for CAS validation on commit)
+	var originalVersion uint64 = 0
+	_, version, err := s.shard.GetLatest(req.Key)
+	if err == nil {
+		originalVersion = version
+	}
+	// If key not found, originalVersion remains 0
+
+	buf.PutWrite(req.Key, req.Value, originalVersion)
+	return &pb.TxWriteResponse{OriginalVersion: originalVersion}, nil
 }
 
 // TxDelete buffers a delete operation for a transaction.
+// Returns the original version of the key before this delete.
 func (s *Server) TxDelete(ctx context.Context, req *pb.TxDeleteRequest) (*pb.TxDeleteResponse, error) {
 	buf := s.bufferMgr.GetOrCreate(req.TxId)
-	buf.Delete(req.Key)
-	return &pb.TxDeleteResponse{}, nil
+
+	// Get original version of the key (for CAS validation on commit)
+	var originalVersion uint64 = 0
+	_, version, err := s.shard.GetLatest(req.Key)
+	if err == nil {
+		originalVersion = version
+	}
+	// If key not found, originalVersion remains 0
+
+	buf.PutDelete(req.Key, originalVersion)
+	return &pb.TxDeleteResponse{OriginalVersion: originalVersion}, nil
 }
 
 // Prepare handles the 2PC prepare phase.
+// For SI/SER isolation levels, validates write set with CAS check.
+// For SER isolation level, also validates read set with CAS check.
 func (s *Server) Prepare(ctx context.Context, req *pb.PrepareRequest) (*pb.PrepareResponse, error) {
 	// Register transaction
 	s.txStatusTbl.Begin(req.TxId)
 
-	// Store write buffer from request
+	// Get or create buffer and merge write set from request
 	buf := s.bufferMgr.GetOrCreate(req.TxId)
-	for _, op := range req.WriteBuffer {
+	for _, op := range req.WriteSet {
 		if op.Deleted {
-			buf.Delete(op.Key)
+			buf.PutDelete(op.Key, op.OriginalVersion)
 		} else {
-			buf.Put(op.Key, op.Value)
+			buf.PutWrite(op.Key, op.Value, op.OriginalVersion)
 		}
 	}
 
+	// Merge read set from request
+	for _, r := range req.ReadSet {
+		buf.RecordRead(r.Key, r.Version, r.Found)
+	}
+
 	// Acquire write locks on all keys in write buffer
-	for _, key := range buf.Keys() {
+	for _, key := range buf.WriteKeys() {
 		if err := s.lockMgr.AcquireWrite(req.TxId, key); err != nil {
 			// Lock conflict - abort
 			s.lockMgr.Release(req.TxId)
@@ -102,17 +137,67 @@ func (s *Server) Prepare(ctx context.Context, req *pb.PrepareRequest) (*pb.Prepa
 		}
 	}
 
-	// Validate check set (no writes since snapshot)
-	for _, key := range req.CheckSet {
-		_, version, err := s.shard.GetLatest(key)
-		if err == nil && version > req.SnapshotTime {
-			// Conflict detected
-			s.lockMgr.Release(req.TxId)
-			s.bufferMgr.Remove(req.TxId)
-			s.txStatusTbl.Abort(req.TxId)
-			return &pb.PrepareResponse{
-				Vote: pb.Vote_VOTE_ABORT,
-			}, nil
+	// CAS validation based on isolation level
+	isoLevel := req.IsolationLevel
+
+	// For SI and SER: Check that write set keys haven't been modified
+	if isoLevel == pb.IsolationLevel_ISOLATION_SI || isoLevel == pb.IsolationLevel_ISOLATION_SER {
+		for _, op := range buf.WriteOps() {
+			_, currentVersion, err := s.shard.GetLatest(op.Key)
+			if err != nil {
+				// Key not found - original version should be 0
+				if op.OriginalVersion != 0 {
+					// Key was deleted by another transaction
+					s.lockMgr.Release(req.TxId)
+					s.bufferMgr.Remove(req.TxId)
+					s.txStatusTbl.Abort(req.TxId)
+					return &pb.PrepareResponse{Vote: pb.Vote_VOTE_ABORT}, nil
+				}
+			} else {
+				// Key exists - check version hasn't changed
+				if currentVersion != op.OriginalVersion {
+					// Key was modified by another transaction
+					s.lockMgr.Release(req.TxId)
+					s.bufferMgr.Remove(req.TxId)
+					s.txStatusTbl.Abort(req.TxId)
+					return &pb.PrepareResponse{Vote: pb.Vote_VOTE_ABORT}, nil
+				}
+			}
+		}
+	}
+
+	// For SER: Additionally check that read set keys haven't been modified
+	if isoLevel == pb.IsolationLevel_ISOLATION_SER {
+		for _, r := range buf.ReadRecords() {
+			_, currentVersion, err := s.shard.GetLatest(r.Key)
+			if err != nil {
+				// Key not found now
+				if r.Found {
+					// Key was found during read but now gone - conflict
+					s.lockMgr.Release(req.TxId)
+					s.bufferMgr.Remove(req.TxId)
+					s.txStatusTbl.Abort(req.TxId)
+					return &pb.PrepareResponse{Vote: pb.Vote_VOTE_ABORT}, nil
+				}
+				// Key was not found during read and still not found - OK
+			} else {
+				// Key exists now
+				if !r.Found {
+					// Key was not found during read but exists now - conflict
+					s.lockMgr.Release(req.TxId)
+					s.bufferMgr.Remove(req.TxId)
+					s.txStatusTbl.Abort(req.TxId)
+					return &pb.PrepareResponse{Vote: pb.Vote_VOTE_ABORT}, nil
+				}
+				// Key was found during read - check version
+				if currentVersion != r.Version {
+					// Key was modified - conflict
+					s.lockMgr.Release(req.TxId)
+					s.bufferMgr.Remove(req.TxId)
+					s.txStatusTbl.Abort(req.TxId)
+					return &pb.PrepareResponse{Vote: pb.Vote_VOTE_ABORT}, nil
+				}
+			}
 		}
 	}
 
@@ -134,7 +219,7 @@ func (s *Server) Commit(ctx context.Context, req *pb.CommitRequest) (*pb.CommitR
 	}
 
 	// Apply all buffered writes with commit timestamp
-	for _, op := range buf.Ops() {
+	for _, op := range buf.WriteOps() {
 		if op.Deleted {
 			s.shard.DeleteWithVersion(op.Key, req.CommitTime)
 		} else {

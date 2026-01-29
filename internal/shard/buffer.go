@@ -6,93 +6,140 @@ import (
 
 // WriteOp represents a pending write operation in the buffer.
 type WriteOp struct {
+	Key             string
+	Value           string
+	Deleted         bool
+	OriginalVersion uint64 // Version of key before this write (0 if key not exists)
+}
+
+// ReadRecord represents a read operation with its version.
+type ReadRecord struct {
 	Key     string
-	Value   string
-	Deleted bool
+	Version uint64 // Version read (0 if key not found)
+	Found   bool
 }
 
-// TxWriteBuffer stores pending writes for a single transaction.
-type TxWriteBuffer struct {
-	txId    string
-	ops     map[string]*WriteOp // key -> latest op
-	opOrder []string            // insertion order for deterministic apply
+// TxBuffer stores pending writes and read records for a single transaction.
+type TxBuffer struct {
+	txId      string
+	writes    map[string]*WriteOp   // key -> latest write op
+	writeOrder []string             // insertion order for deterministic apply
+	reads     map[string]*ReadRecord // key -> read record (external reads only)
 }
 
-// NewTxWriteBuffer creates a new write buffer for a transaction.
-func NewTxWriteBuffer(txId string) *TxWriteBuffer {
-	return &TxWriteBuffer{
-		txId:    txId,
-		ops:     make(map[string]*WriteOp),
-		opOrder: make([]string, 0),
+// NewTxBuffer creates a new transaction buffer.
+func NewTxBuffer(txId string) *TxBuffer {
+	return &TxBuffer{
+		txId:       txId,
+		writes:     make(map[string]*WriteOp),
+		writeOrder: make([]string, 0),
+		reads:      make(map[string]*ReadRecord),
 	}
 }
 
-// Put adds a write operation to the buffer.
-func (b *TxWriteBuffer) Put(key, value string) {
-	if _, exists := b.ops[key]; !exists {
-		b.opOrder = append(b.opOrder, key)
+// PutWrite adds a write operation to the buffer with original version.
+func (b *TxBuffer) PutWrite(key, value string, originalVersion uint64) {
+	if _, exists := b.writes[key]; !exists {
+		b.writeOrder = append(b.writeOrder, key)
 	}
-	b.ops[key] = &WriteOp{Key: key, Value: value, Deleted: false}
+	b.writes[key] = &WriteOp{
+		Key:             key,
+		Value:           value,
+		Deleted:         false,
+		OriginalVersion: originalVersion,
+	}
 }
 
-// Delete adds a delete operation to the buffer.
-func (b *TxWriteBuffer) Delete(key string) {
-	if _, exists := b.ops[key]; !exists {
-		b.opOrder = append(b.opOrder, key)
+// PutDelete adds a delete operation to the buffer with original version.
+func (b *TxBuffer) PutDelete(key string, originalVersion uint64) {
+	if _, exists := b.writes[key]; !exists {
+		b.writeOrder = append(b.writeOrder, key)
 	}
-	b.ops[key] = &WriteOp{Key: key, Value: "", Deleted: true}
+	b.writes[key] = &WriteOp{
+		Key:             key,
+		Value:           "",
+		Deleted:         true,
+		OriginalVersion: originalVersion,
+	}
 }
 
-// Get retrieves a pending write for a key (for read-your-writes).
-func (b *TxWriteBuffer) Get(key string) (*WriteOp, bool) {
-	op, ok := b.ops[key]
+// GetWrite retrieves a pending write for a key (for read-your-writes).
+func (b *TxBuffer) GetWrite(key string) (*WriteOp, bool) {
+	op, ok := b.writes[key]
 	return op, ok
 }
 
-// Keys returns all keys in the buffer.
-func (b *TxWriteBuffer) Keys() []string {
-	return b.opOrder
+// RecordRead records an external read operation.
+func (b *TxBuffer) RecordRead(key string, version uint64, found bool) {
+	// Only record if not already in write set (no need to track read-your-writes)
+	if _, inWriteSet := b.writes[key]; !inWriteSet {
+		b.reads[key] = &ReadRecord{
+			Key:     key,
+			Version: version,
+			Found:   found,
+		}
+	}
 }
 
-// Ops returns all operations in insertion order.
-func (b *TxWriteBuffer) Ops() []*WriteOp {
-	result := make([]*WriteOp, 0, len(b.opOrder))
-	for _, key := range b.opOrder {
-		result = append(result, b.ops[key])
+// WriteKeys returns all keys in the write buffer.
+func (b *TxBuffer) WriteKeys() []string {
+	return b.writeOrder
+}
+
+// WriteOps returns all write operations in insertion order.
+func (b *TxBuffer) WriteOps() []*WriteOp {
+	result := make([]*WriteOp, 0, len(b.writeOrder))
+	for _, key := range b.writeOrder {
+		result = append(result, b.writes[key])
+	}
+	return result
+}
+
+// ReadRecords returns all read records.
+func (b *TxBuffer) ReadRecords() []*ReadRecord {
+	result := make([]*ReadRecord, 0, len(b.reads))
+	for _, r := range b.reads {
+		result = append(result, r)
 	}
 	return result
 }
 
 // TxId returns the transaction ID.
-func (b *TxWriteBuffer) TxId() string {
+func (b *TxBuffer) TxId() string {
 	return b.txId
 }
 
-// WriteBufferManager manages write buffers for all active transactions.
-type WriteBufferManager struct {
-	mu      sync.RWMutex
-	buffers map[string]*TxWriteBuffer // txId -> buffer
+// HasWrite checks if a key is in the write set.
+func (b *TxBuffer) HasWrite(key string) bool {
+	_, ok := b.writes[key]
+	return ok
 }
 
-// NewWriteBufferManager creates a new write buffer manager.
-func NewWriteBufferManager() *WriteBufferManager {
-	return &WriteBufferManager{
-		buffers: make(map[string]*TxWriteBuffer),
+// TxBufferManager manages transaction buffers for all active transactions.
+type TxBufferManager struct {
+	mu      sync.RWMutex
+	buffers map[string]*TxBuffer // txId -> buffer
+}
+
+// NewTxBufferManager creates a new transaction buffer manager.
+func NewTxBufferManager() *TxBufferManager {
+	return &TxBufferManager{
+		buffers: make(map[string]*TxBuffer),
 	}
 }
 
-// Begin creates a new write buffer for a transaction.
-func (m *WriteBufferManager) Begin(txId string) *TxWriteBuffer {
+// Begin creates a new buffer for a transaction.
+func (m *TxBufferManager) Begin(txId string) *TxBuffer {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	buf := NewTxWriteBuffer(txId)
+	buf := NewTxBuffer(txId)
 	m.buffers[txId] = buf
 	return buf
 }
 
-// Get retrieves the write buffer for a transaction.
-func (m *WriteBufferManager) Get(txId string) (*TxWriteBuffer, bool) {
+// Get retrieves the buffer for a transaction.
+func (m *TxBufferManager) Get(txId string) (*TxBuffer, bool) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
@@ -100,8 +147,8 @@ func (m *WriteBufferManager) Get(txId string) (*TxWriteBuffer, bool) {
 	return buf, ok
 }
 
-// Remove removes the write buffer for a transaction.
-func (m *WriteBufferManager) Remove(txId string) {
+// Remove removes the buffer for a transaction.
+func (m *TxBufferManager) Remove(txId string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -109,7 +156,7 @@ func (m *WriteBufferManager) Remove(txId string) {
 }
 
 // GetOrCreate gets existing buffer or creates a new one.
-func (m *WriteBufferManager) GetOrCreate(txId string) *TxWriteBuffer {
+func (m *TxBufferManager) GetOrCreate(txId string) *TxBuffer {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -117,7 +164,7 @@ func (m *WriteBufferManager) GetOrCreate(txId string) *TxWriteBuffer {
 		return buf
 	}
 
-	buf := NewTxWriteBuffer(txId)
+	buf := NewTxBuffer(txId)
 	m.buffers[txId] = buf
 	return buf
 }

@@ -4,6 +4,17 @@ package shard;
 
 option go_package = "github.com/let-mil-go/proto/shardpb";
 
+// IsolationLevel defines transaction isolation levels.
+enum IsolationLevel {
+  ISOLATION_UNKNOWN = 0;
+  ISOLATION_RA = 1;   // Read Atomic
+  ISOLATION_CC = 2;   // Causal Consistency
+  ISOLATION_PC = 3;   // Prefix Consistency
+  ISOLATION_PSI = 4;  // Parallel Snapshot Isolation
+  ISOLATION_SI = 5;   // Snapshot Isolation
+  ISOLATION_SER = 6;  // Serializable
+}
+
 // ShardService provides transactional KV operations on a shard.
 service ShardService {
   // Transaction operations (buffered until commit)
@@ -29,7 +40,7 @@ message TxReadRequest {
 
 message TxReadResponse {
   string value = 1;
-  uint64 version = 2;
+  uint64 version = 2;  // Version of the value read (0 if not found)
   bool found = 3;
 }
 
@@ -40,7 +51,9 @@ message TxWriteRequest {
   string value = 3;
 }
 
-message TxWriteResponse {}
+message TxWriteResponse {
+  uint64 original_version = 1;  // Version of key before write (0 if not exists)
+}
 
 // Transaction Delete (buffered)
 message TxDeleteRequest {
@@ -48,20 +61,32 @@ message TxDeleteRequest {
   string key = 2;
 }
 
-message TxDeleteResponse {}
-
-// 2PC Prepare
-message PrepareRequest {
-  string tx_id = 1;
-  repeated WriteOp write_buffer = 2;  // Writes to prepare
-  repeated string check_set = 3;       // Keys to check for conflicts
-  uint64 snapshot_time = 4;            // Snapshot time for validation
+message TxDeleteResponse {
+  uint64 original_version = 1;  // Version of key before delete (0 if not exists)
 }
 
+// WriteOp with original version for CAS validation
 message WriteOp {
   string key = 1;
   string value = 2;
   bool deleted = 3;
+  uint64 original_version = 4;  // Version when write was buffered
+}
+
+// ReadRecord for CAS validation in SER
+message ReadRecord {
+  string key = 1;
+  uint64 version = 2;  // Version that was read
+  bool found = 3;
+}
+
+// 2PC Prepare
+message PrepareRequest {
+  string tx_id = 1;
+  repeated WriteOp write_set = 2;     // Writes with original versions
+  repeated ReadRecord read_set = 3;   // Reads for SER validation
+  uint64 snapshot_time = 4;           // Snapshot time for validation
+  IsolationLevel isolation_level = 5; // Transaction isolation level
 }
 
 message PrepareResponse {
