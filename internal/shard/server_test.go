@@ -16,8 +16,14 @@ func TestSingleTransactionSuccess(t *testing.T) {
 	key := "key-1"
 	value := "value-1"
 
+	// 0. Start Tx
+	_, err := s.TxStart(ctx, &pb.TxStartRequest{TxId: txId})
+	if err != nil {
+		t.Fatalf("TxStart failed: %v", err)
+	}
+
 	// 1. Write
-	_, err := s.TxWrite(ctx, &pb.TxWriteRequest{
+	_, err = s.TxWrite(ctx, &pb.TxWriteRequest{
 		TxId:  txId,
 		Key:   key,
 		Value: value,
@@ -68,7 +74,12 @@ func TestConcurrentTransactionsConflict(t *testing.T) {
 
 	// T1 starts first
 	tx1 := "tx-1"
-	_, err := s.TxWrite(ctx, &pb.TxWriteRequest{
+	_, err := s.TxStart(ctx, &pb.TxStartRequest{TxId: tx1})
+	if err != nil {
+		t.Fatalf("Tx1 Start failed: %v", err)
+	}
+
+	_, err = s.TxWrite(ctx, &pb.TxWriteRequest{
 		TxId:  tx1,
 		Key:   key,
 		Value: "val-1",
@@ -79,6 +90,11 @@ func TestConcurrentTransactionsConflict(t *testing.T) {
 
 	// T2 starts later (after T1 writes)
 	tx2 := "tx-2"
+	_, err = s.TxStart(ctx, &pb.TxStartRequest{TxId: tx2})
+	if err != nil {
+		t.Fatalf("Tx2 Start failed: %v", err)
+	}
+
 	_, err = s.TxWrite(ctx, &pb.TxWriteRequest{
 		TxId:  tx2,
 		Key:   key, // Same key conflict
