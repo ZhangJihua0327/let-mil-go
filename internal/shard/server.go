@@ -3,10 +3,10 @@ package shard
 import (
 	"context"
 	"errors"
+	"github.com/let-mil-go/internal/hlc"
 
 	"github.com/let-mil-go/internal/shard/component"
 
-	"github.com/let-mil-go/internal/common/hlc"
 	"github.com/let-mil-go/internal/model"
 	pb "github.com/let-mil-go/proto/shardpb"
 	"google.golang.org/grpc/codes"

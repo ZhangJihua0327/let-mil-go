@@ -2,9 +2,8 @@ package csrs
 
 import (
 	"fmt"
+	"github.com/let-mil-go/internal/hlc"
 	"sync"
-
-	"github.com/let-mil-go/internal/common/hlc"
 )
 
 // TopologyManager is the central component for managing cluster topology.

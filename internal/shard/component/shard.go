@@ -1,7 +1,7 @@
 package component
 
 import (
-	"github.com/let-mil-go/internal/common/hlc"
+	"github.com/let-mil-go/internal/hlc"
 )
 
 // Shard represents a single data shard in the distributed database.

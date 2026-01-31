@@ -2,10 +2,9 @@ package csrs
 
 import (
 	"fmt"
+	"github.com/let-mil-go/internal/hlc"
 	"sync"
 	"testing"
-
-	"github.com/let-mil-go/internal/common/hlc"
 )
 
 func TestShardRegistry_RegisterAndGet(t *testing.T) {

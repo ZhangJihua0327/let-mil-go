@@ -3,9 +3,9 @@ package mulberry
 import (
 	"context"
 	"fmt"
+	"github.com/let-mil-go/internal/hlc"
 	"sync"
 
-	"github.com/let-mil-go/internal/common/hlc"
 	"github.com/let-mil-go/internal/csrs"
 	pb "github.com/let-mil-go/proto/shardpb"
 )
