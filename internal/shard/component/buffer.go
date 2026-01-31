@@ -128,8 +128,8 @@ func NewTxBufferManager() *TxBufferManager {
 	}
 }
 
-// Begin creates a new buffer for a transaction.
-func (m *TxBufferManager) Begin(txId string) *TxBuffer {
+// Start creates a new buffer for a transaction.
+func (m *TxBufferManager) Start(txId string) *TxBuffer {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 

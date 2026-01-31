@@ -91,7 +91,7 @@ func (s *Shard) TxStart(txId string) error {
 	}
 
 	// Create buffer for this transaction
-	s.bufferMgr.Begin(txId)
+	s.bufferMgr.Start(txId)
 	return nil
 }
 
@@ -197,7 +197,7 @@ func (s *Shard) Prepare(txId string, isoLevel pb.IsolationLevel) (pb.Vote, uint6
 		return pb.Vote_VOTE_ABORT, 0, ErrTxNoOps
 	}
 
-	s.txStatusTbl.Begin(txId)
+	s.txStatusTbl.Start(txId)
 
 	abortAndCleanup := func() (pb.Vote, uint64, error) {
 		s.abortCleanup(txId)

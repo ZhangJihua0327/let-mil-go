@@ -46,8 +46,8 @@ func NewTxStatusTable() *TxStatusTable {
 	}
 }
 
-// Begin registers a new transaction as RUNNING.
-func (t *TxStatusTable) Begin(txId string) {
+// Start registers a new transaction as RUNNING.
+func (t *TxStatusTable) Start(txId string) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.states[txId] = &TxState{Status: TxRunning}
