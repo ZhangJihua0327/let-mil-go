@@ -1,0 +1,61 @@
+syntax = "proto3";
+
+package mulberry;
+
+option go_package = "github.com/let-mil-go/proto/mulberrypb";
+
+import "proto/shard.proto";
+
+service MulberryService {
+  rpc BeginTransaction(BeginTransactionRequest) returns (BeginTransactionResponse);
+  rpc Read(ReadRequest) returns (ReadResponse);
+  rpc Write(WriteRequest) returns (WriteResponse);
+  rpc Delete(DeleteRequest) returns (DeleteResponse);
+  rpc Commit(CommitRequest) returns (CommitResponse);
+  rpc Abort(AbortRequest) returns (AbortResponse);
+}
+
+message BeginTransactionRequest {
+  shard.IsolationLevel isolation_level = 1;
+}
+
+message BeginTransactionResponse {
+  string tx_id = 1;
+}
+
+message ReadRequest {
+  string tx_id = 1;
+  string key = 2;
+}
+
+message ReadResponse {
+  string value = 1;
+  bool found = 2;
+}
+
+message WriteRequest {
+  string tx_id = 1;
+  string key = 2;
+  string value = 3;
+}
+
+message WriteResponse {}
+
+message DeleteRequest {
+  string tx_id = 1;
+  string key = 2;
+}
+
+message DeleteResponse {}
+
+message CommitRequest {
+  string tx_id = 1;
+}
+
+message CommitResponse {}
+
+message AbortRequest {
+  string tx_id = 1;
+}
+
+message AbortResponse {}
