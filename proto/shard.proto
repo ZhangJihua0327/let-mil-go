@@ -17,6 +17,9 @@ enum IsolationLevel {
 
 // ShardService provides transactional KV operations on a shard.
 service ShardService {
+  // Transaction lifecycle
+  rpc TxStart(TxStartRequest) returns (TxStartResponse);
+
   // Transaction operations (buffered until commit)
   rpc TxRead(TxReadRequest) returns (TxReadResponse);
   rpc TxWrite(TxWriteRequest) returns (TxWriteResponse);
@@ -30,6 +33,14 @@ service ShardService {
   // Shard metadata
   rpc GetCurrentTime(GetCurrentTimeRequest) returns (GetCurrentTimeResponse);
 }
+
+// Transaction Start
+message TxStartRequest {
+  string tx_id = 1;
+  uint64 snapshot_time = 2;  // HLC timestamp for snapshot reads
+}
+
+message TxStartResponse {}
 
 // Transaction Read
 message TxReadRequest {

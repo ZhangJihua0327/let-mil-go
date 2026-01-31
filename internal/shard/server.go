@@ -48,10 +48,27 @@ func (s *Server) hlcNow() uint64 {
 	return s.hlc.Now()
 }
 
+// TxStart initializes a new transaction on this shard.
+// Creates the transaction buffer for subsequent operations.
+func (s *Server) TxStart(ctx context.Context, req *pb.TxStartRequest) (*pb.TxStartResponse, error) {
+	// Check if transaction already exists
+	if _, ok := s.bufferMgr.Get(req.TxId); ok {
+		return nil, status.Error(codes.AlreadyExists, "transaction already exists")
+	}
+
+	// Create buffer for this transaction
+	s.bufferMgr.Begin(req.TxId)
+
+	return &pb.TxStartResponse{}, nil
+}
+
 // TxRead reads a value within a transaction context.
 // External reads are recorded in the buffer for SER isolation level validation.
 func (s *Server) TxRead(ctx context.Context, req *pb.TxReadRequest) (*pb.TxReadResponse, error) {
-	buf := s.bufferMgr.GetOrCreate(req.TxId)
+	buf, ok := s.bufferMgr.Get(req.TxId)
+	if !ok {
+		return nil, status.Error(codes.NotFound, "transaction not found, call TxStart first")
+	}
 
 	// Check write buffer first (read-your-writes)
 	// Internal reads don't need version tracking
@@ -97,7 +114,10 @@ func (s *Server) TxRead(ctx context.Context, req *pb.TxReadRequest) (*pb.TxReadR
 // TxWrite buffers a write operation for a transaction.
 // Returns the original version of the key before this write.
 func (s *Server) TxWrite(ctx context.Context, req *pb.TxWriteRequest) (*pb.TxWriteResponse, error) {
-	buf := s.bufferMgr.GetOrCreate(req.TxId)
+	buf, ok := s.bufferMgr.Get(req.TxId)
+	if !ok {
+		return nil, status.Error(codes.NotFound, "transaction not found, call TxStart first")
+	}
 
 	// Get original version of the key (for CAS validation on commit)
 	var originalVersion uint64 = 0
@@ -122,7 +142,10 @@ func (s *Server) TxWrite(ctx context.Context, req *pb.TxWriteRequest) (*pb.TxWri
 // TxDelete buffers a delete operation for a transaction.
 // Returns the original version of the key before this delete.
 func (s *Server) TxDelete(ctx context.Context, req *pb.TxDeleteRequest) (*pb.TxDeleteResponse, error) {
-	buf := s.bufferMgr.GetOrCreate(req.TxId)
+	buf, ok := s.bufferMgr.Get(req.TxId)
+	if !ok {
+		return nil, status.Error(codes.NotFound, "transaction not found, call TxStart first")
+	}
 
 	// Get original version of the key (for CAS validation on commit)
 	var originalVersion uint64 = 0
@@ -147,25 +170,45 @@ func (s *Server) TxDelete(ctx context.Context, req *pb.TxDeleteRequest) (*pb.TxD
 // For SI/SER isolation levels, validates write set with CAS check.
 // For SER isolation level, also validates read set with CAS check.
 func (s *Server) Prepare(ctx context.Context, req *pb.PrepareRequest) (*pb.PrepareResponse, error) {
-	// Register transaction
-	s.txStatusTbl.Begin(req.TxId)
-
 	// Get buffer - must exist from previous TxRead/TxWrite/TxDelete calls
 	buf, ok := s.bufferMgr.Get(req.TxId)
 	if !ok {
 		return nil, status.Error(codes.NotFound, "transaction not found")
 	}
 
+	// Check if buffer has any operations
+	if len(buf.WriteOps()) == 0 && len(buf.ReadRecords()) == 0 {
+		s.lockMgr.Release(req.TxId)
+		s.bufferMgr.Remove(req.TxId)
+		s.txStatusTbl.Abort(req.TxId)
+		s.oplog.Append(&component.OpEntry{
+			Timestamp: s.hlcTick(),
+			TxId:      req.TxId,
+			OpType:    component.OpTypeRelease,
+		})
+		return nil, status.Error(codes.NotFound, "transaction has no operations")
+	}
+
+	// Register transaction
+	s.txStatusTbl.Begin(req.TxId)
+
+	// Helper to abort and cleanup
+	abortAndCleanup := func() *pb.PrepareResponse {
+		s.lockMgr.Release(req.TxId)
+		s.bufferMgr.Remove(req.TxId)
+		s.txStatusTbl.Abort(req.TxId)
+		s.oplog.Append(&component.OpEntry{
+			Timestamp: s.hlcTick(),
+			TxId:      req.TxId,
+			OpType:    component.OpTypeAbort,
+		})
+		return &pb.PrepareResponse{Vote: pb.Vote_VOTE_ABORT}
+	}
+
 	// Acquire write locks on all keys in write buffer
 	for _, key := range buf.WriteKeys() {
 		if err := s.lockMgr.AcquireWrite(req.TxId, key); err != nil {
-			// Lock conflict - abort
-			s.lockMgr.Release(req.TxId)
-			s.bufferMgr.Remove(req.TxId)
-			s.txStatusTbl.Abort(req.TxId)
-			return &pb.PrepareResponse{
-				Vote: pb.Vote_VOTE_ABORT,
-			}, nil
+			return abortAndCleanup(), nil
 		}
 	}
 
@@ -179,20 +222,12 @@ func (s *Server) Prepare(ctx context.Context, req *pb.PrepareRequest) (*pb.Prepa
 			if err != nil {
 				// Key not found - original version should be 0
 				if op.OriginalVersion != 0 {
-					// Key was deleted by another transaction
-					s.lockMgr.Release(req.TxId)
-					s.bufferMgr.Remove(req.TxId)
-					s.txStatusTbl.Abort(req.TxId)
-					return &pb.PrepareResponse{Vote: pb.Vote_VOTE_ABORT}, nil
+					return abortAndCleanup(), nil
 				}
 			} else {
 				// Key exists - check version hasn't changed
 				if currentVersion != op.OriginalVersion {
-					// Key was modified by another transaction
-					s.lockMgr.Release(req.TxId)
-					s.bufferMgr.Remove(req.TxId)
-					s.txStatusTbl.Abort(req.TxId)
-					return &pb.PrepareResponse{Vote: pb.Vote_VOTE_ABORT}, nil
+					return abortAndCleanup(), nil
 				}
 			}
 		}
@@ -205,29 +240,16 @@ func (s *Server) Prepare(ctx context.Context, req *pb.PrepareRequest) (*pb.Prepa
 			if err != nil {
 				// Key not found now
 				if r.Found {
-					// Key was found during read but now gone - conflict
-					s.lockMgr.Release(req.TxId)
-					s.bufferMgr.Remove(req.TxId)
-					s.txStatusTbl.Abort(req.TxId)
-					return &pb.PrepareResponse{Vote: pb.Vote_VOTE_ABORT}, nil
+					return abortAndCleanup(), nil
 				}
-				// Key was not found during read and still not found - OK
 			} else {
 				// Key exists now
 				if !r.Found {
-					// Key was not found during read but exists now - conflict
-					s.lockMgr.Release(req.TxId)
-					s.bufferMgr.Remove(req.TxId)
-					s.txStatusTbl.Abort(req.TxId)
-					return &pb.PrepareResponse{Vote: pb.Vote_VOTE_ABORT}, nil
+					return abortAndCleanup(), nil
 				}
 				// Key was found during read - check version
 				if currentVersion != r.Version {
-					// Key was modified - conflict
-					s.lockMgr.Release(req.TxId)
-					s.bufferMgr.Remove(req.TxId)
-					s.txStatusTbl.Abort(req.TxId)
-					return &pb.PrepareResponse{Vote: pb.Vote_VOTE_ABORT}, nil
+					return abortAndCleanup(), nil
 				}
 			}
 		}

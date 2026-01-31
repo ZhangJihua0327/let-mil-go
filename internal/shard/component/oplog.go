@@ -9,6 +9,7 @@ const (
 	OpTypeRead
 	OpTypeCommit
 	OpTypeAbort
+	OpTypeRelease
 )
 
 // OpEntry represents a single operation log entry.
