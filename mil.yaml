@@ -1,0 +1,39 @@
+
+mil-db-sterotype:
+  # Shard node list configuration
+  shards:
+    # Shard 1 configuration (primary node of replica set rs-shard1)
+    shard1:
+      shard_name: "shard0001"    # Official shard naming convention: shard + 4-digit number
+      ip: "192.168.10.11"       # Private IP address of shard 1 server
+      port: 27018                # MongoDB service port (avoid default 27017 for shard nodes)
+      replica_set: "rs-shard1"   # Replica set name for high availability (required in production)
+      priority: 1                # Replica set node priority (1 = primary node)
+    # Shard 2 configuration (primary node of replica set rs-shard2)
+    shard2:
+      shard_name: "shard0002"
+      ip: "192.168.10.12"
+      port: 27019
+      replica_set: "rs-shard2"
+      priority: 1
+    # Shard 3 configuration (primary node of replica set rs-shard3)
+    shard3:
+      shard_name: "shard0003"
+      ip: "192.168.10.13"
+      port: 27020
+      replica_set: "rs-shard3"
+      priority: 1
+    # Shard 4 configuration (primary node of replica set rs-shard4)
+    shard4:
+      shard_name: "shard0004"
+      ip: "192.168.10.14"
+      port: 27021
+      replica_set: "rs-shard4"
+      priority: 1
+    # Shard 5 configuration (primary node of replica set rs-shard5)
+    shard5:
+      shard_name: "shard0005"
+      ip: "192.168.10.15"
+      port: 27022
+      replica_set: "rs-shard5"
+      priority: 1

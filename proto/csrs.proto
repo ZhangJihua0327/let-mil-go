@@ -1,0 +1,101 @@
+syntax = "proto3";
+
+package csrs;
+
+option go_package = "github.com/let-mil-go/proto/csrspb";
+
+// CSRSService provides config server functionality for topology management.
+// Acts as the source of truth for shard metadata, similar to MongoDB's CSRS.
+service CSRSService {
+  // GetShardAddressMap returns the global mapping of shard-name to ip:port.
+  rpc GetShardAddressMap(GetShardAddressMapRequest) returns (GetShardAddressMapResponse);
+
+  // GetTopologyVersion returns the current topology version (HLC timestamp).
+  rpc GetTopologyVersion(GetTopologyVersionRequest) returns (GetTopologyVersionResponse);
+
+  // GetShardForKey returns the shard responsible for a given key.
+  rpc GetShardForKey(GetShardForKeyRequest) returns (GetShardForKeyResponse);
+
+  // RegisterShard registers a new shard with the topology.
+  rpc RegisterShard(RegisterShardRequest) returns (RegisterShardResponse);
+
+  // UnregisterShard removes a shard from the topology.
+  rpc UnregisterShard(UnregisterShardRequest) returns (UnregisterShardResponse);
+
+  // UpdateShardStatus updates the operational status of a shard.
+  rpc UpdateShardStatus(UpdateShardStatusRequest) returns (UpdateShardStatusResponse);
+
+  // BumpTopologyVersion manually increments the topology version.
+  rpc BumpTopologyVersion(BumpTopologyVersionRequest) returns (BumpTopologyVersionResponse);
+}
+
+// ShardStatus represents the operational status of a shard.
+enum ShardStatus {
+  SHARD_STATUS_UNKNOWN = 0;
+  SHARD_STATUS_ACTIVE = 1;
+  SHARD_STATUS_DRAINING = 2;
+  SHARD_STATUS_OFFLINE = 3;
+}
+
+// GetShardAddressMap
+message GetShardAddressMapRequest {}
+
+message GetShardAddressMapResponse {
+  map<string, string> shard_addresses = 1;  // shard_name -> ip:port
+  uint64 topology_version = 2;
+}
+
+// GetTopologyVersion
+message GetTopologyVersionRequest {}
+
+message GetTopologyVersionResponse {
+  uint64 topology_version = 1;
+}
+
+// GetShardForKey
+message GetShardForKeyRequest {
+  string key = 1;
+}
+
+message GetShardForKeyResponse {
+  string shard_id = 1;
+  string address = 2;
+}
+
+// RegisterShard
+message RegisterShardRequest {
+  string shard_id = 1;
+  string address = 2;       // ip:port
+  string replica_set = 3;   // optional replica set name
+  int32 priority = 4;       // node priority
+}
+
+message RegisterShardResponse {
+  uint64 topology_version = 1;
+}
+
+// UnregisterShard
+message UnregisterShardRequest {
+  string shard_id = 1;
+}
+
+message UnregisterShardResponse {
+  uint64 topology_version = 1;
+}
+
+// UpdateShardStatus
+message UpdateShardStatusRequest {
+  string shard_id = 1;
+  ShardStatus status = 2;
+}
+
+message UpdateShardStatusResponse {
+  uint64 topology_version = 1;
+}
+
+// BumpTopologyVersion
+message BumpTopologyVersionRequest {}
+
+message BumpTopologyVersionResponse {
+  uint64 topology_version = 1;
+}
