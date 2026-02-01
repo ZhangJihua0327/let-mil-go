@@ -1,0 +1,202 @@
+version: '3.8'
+
+services:
+  # CSRS - Config Server Replica Set (单节点)
+  csrs:
+    build:
+      context: .
+      target: csrs
+    container_name: csrs
+    ports:
+      - "50050:50050"
+    command: ["-port", "50050"]
+    networks:
+      - mil-network
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z localhost 50050 || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # Shard Nodes (5个)
+  shard1:
+    build:
+      context: .
+      target: shard
+    container_name: shard1
+    ports:
+      - "50051:50051"
+    environment:
+      - SHARD_ADVERTISE_ADDR=shard1:50051
+    command: ["-id", "shard0001", "-port", "50051", "-csrs", "csrs:50050", "-replica-set", "rs-shard1"]
+    depends_on:
+      csrs:
+        condition: service_healthy
+    networks:
+      - mil-network
+
+  shard2:
+    build:
+      context: .
+      target: shard
+    container_name: shard2
+    ports:
+      - "50052:50052"
+    environment:
+      - SHARD_ADVERTISE_ADDR=shard2:50052
+    command: ["-id", "shard0002", "-port", "50052", "-csrs", "csrs:50050", "-replica-set", "rs-shard2"]
+    depends_on:
+      csrs:
+        condition: service_healthy
+    networks:
+      - mil-network
+
+  shard3:
+    build:
+      context: .
+      target: shard
+    container_name: shard3
+    ports:
+      - "50053:50053"
+    environment:
+      - SHARD_ADVERTISE_ADDR=shard3:50053
+    command: ["-id", "shard0003", "-port", "50053", "-csrs", "csrs:50050", "-replica-set", "rs-shard3"]
+    depends_on:
+      csrs:
+        condition: service_healthy
+    networks:
+      - mil-network
+
+  shard4:
+    build:
+      context: .
+      target: shard
+    container_name: shard4
+    ports:
+      - "50054:50054"
+    environment:
+      - SHARD_ADVERTISE_ADDR=shard4:50054
+    command: ["-id", "shard0004", "-port", "50054", "-csrs", "csrs:50050", "-replica-set", "rs-shard4"]
+    depends_on:
+      csrs:
+        condition: service_healthy
+    networks:
+      - mil-network
+
+  shard5:
+    build:
+      context: .
+      target: shard
+    container_name: shard5
+    ports:
+      - "50055:50055"
+    environment:
+      - SHARD_ADVERTISE_ADDR=shard5:50055
+    command: ["-id", "shard0005", "-port", "50055", "-csrs", "csrs:50050", "-replica-set", "rs-shard5"]
+    depends_on:
+      csrs:
+        condition: service_healthy
+    networks:
+      - mil-network
+
+  # Mulberry Routers (3个)
+  mulberry1:
+    build:
+      context: .
+      target: mulberry
+    container_name: mulberry1
+    ports:
+      - "50061:50061"
+    command: ["-port", "50061", "-csrs", "csrs:50050", "-sync-interval", "5s"]
+    depends_on:
+      - shard1
+      - shard2
+      - shard3
+      - shard4
+      - shard5
+    networks:
+      - mil-network
+
+  mulberry2:
+    build:
+      context: .
+      target: mulberry
+    container_name: mulberry2
+    ports:
+      - "50062:50062"
+    command: ["-port", "50062", "-csrs", "csrs:50050", "-sync-interval", "5s"]
+    depends_on:
+      - shard1
+      - shard2
+      - shard3
+      - shard4
+      - shard5
+    networks:
+      - mil-network
+
+  mulberry3:
+    build:
+      context: .
+      target: mulberry
+    container_name: mulberry3
+    ports:
+      - "50063:50063"
+    command: ["-port", "50063", "-csrs", "csrs:50050", "-sync-interval", "5s"]
+    depends_on:
+      - shard1
+      - shard2
+      - shard3
+      - shard4
+      - shard5
+    networks:
+      - mil-network
+
+  # Client Nodes (3个, 交互式)
+  client1:
+    build:
+      context: .
+      target: client
+    container_name: client1
+    stdin_open: true
+    tty: true
+    command: ["-addr", "mulberry1:50061,mulberry2:50062,mulberry3:50063"]
+    depends_on:
+      - mulberry1
+      - mulberry2
+      - mulberry3
+    networks:
+      - mil-network
+
+  client2:
+    build:
+      context: .
+      target: client
+    container_name: client2
+    stdin_open: true
+    tty: true
+    command: ["-addr", "mulberry1:50061,mulberry2:50062,mulberry3:50063"]
+    depends_on:
+      - mulberry1
+      - mulberry2
+      - mulberry3
+    networks:
+      - mil-network
+
+  client3:
+    build:
+      context: .
+      target: client
+    container_name: client3
+    stdin_open: true
+    tty: true
+    command: ["-addr", "mulberry1:50061,mulberry2:50062,mulberry3:50063"]
+    depends_on:
+      - mulberry1
+      - mulberry2
+      - mulberry3
+    networks:
+      - mil-network
+
+networks:
+  mil-network:
+    driver: bridge
