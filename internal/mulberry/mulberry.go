@@ -3,8 +3,9 @@ package mulberry
 import (
 	"context"
 	"fmt"
-	"github.com/let-mil-go/internal/hlc"
 	"sync"
+
+	"github.com/let-mil-go/internal/hlc"
 
 	"github.com/let-mil-go/internal/csrs"
 	pb "github.com/let-mil-go/proto/shardpb"
@@ -87,9 +88,8 @@ func (r *Router) Read(ctx context.Context, txID string, key string) (string, boo
 	}
 
 	resp, err := stub.TxRead(ctx, &pb.TxReadRequest{
-		TxId:         txID,
-		Key:          key,
-		SnapshotTime: txCtx.SnapshotTime,
+		TxId: txID,
+		Key:  key,
 	})
 	if err != nil {
 		return "", false, fmt.Errorf("TxRead failed: %w", err)
@@ -164,6 +164,8 @@ func (r *Router) Delete(ctx context.Context, txID string, key string) error {
 }
 
 // Commit commits the transaction using 2PC protocol.
+// Phase 1: Prepare all shards. On first VOTE_ABORT, abort all and return immediately.
+// Phase 2: Only commit shards that voted VOTE_COMMIT. Skip VOTE_EMPTY shards.
 func (r *Router) Commit(ctx context.Context, txID string) error {
 	txCtx, err := r.getTxContext(txID)
 	if err != nil {
@@ -171,7 +173,9 @@ func (r *Router) Commit(ctx context.Context, txID string) error {
 	}
 
 	// Phase 1: Prepare
-	prepareResults := make(map[string]uint64)
+	// Track shards that need commit (voted VOTE_COMMIT)
+	commitShards := make(map[string]uint64) // shardID -> prepareTime
+
 	for shardID := range txCtx.InvolvedShards {
 		info := r.topology.GetShardInfo(shardID)
 		if info == nil {
@@ -187,28 +191,48 @@ func (r *Router) Commit(ctx context.Context, txID string) error {
 
 		resp, err := stub.Prepare(ctx, &pb.PrepareRequest{
 			TxId:           txID,
-			SnapshotTime:   txCtx.SnapshotTime,
 			IsolationLevel: txCtx.IsolationLevel,
 		})
-		if err != nil || resp.Vote != pb.Vote_VOTE_COMMIT {
+		if err != nil {
+			// Connection error - abort all immediately
 			r.abortAll(ctx, txID, txCtx)
-			return fmt.Errorf("prepare failed on shard %s", shardID)
+			return fmt.Errorf("prepare failed on shard %s: %w", shardID, err)
 		}
 
-		prepareResults[shardID] = resp.PrepareTime
+		switch resp.Vote {
+		case pb.Vote_VOTE_COMMIT:
+			// Record for phase 2
+			commitShards[shardID] = resp.PrepareTime
+		case pb.Vote_VOTE_NOOP, pb.Vote_VOTE_NOT_FOUND:
+			// Shard already cleaned up, skip in phase 2
+			continue
+		case pb.Vote_VOTE_ABORT:
+			// Abort all immediately without polling remaining shards
+			r.abortAll(ctx, txID, txCtx)
+			return fmt.Errorf("prepare aborted on shard %s", shardID)
+		default:
+			r.abortAll(ctx, txID, txCtx)
+			return fmt.Errorf("unexpected vote %v on shard %s", resp.Vote, shardID)
+		}
+	}
+
+	// If no shards need commit (all VOTE_EMPTY), just cleanup and return
+	if len(commitShards) == 0 {
+		r.removeTxContext(txID)
+		return nil
 	}
 
 	// Calculate commit time as max of all prepare times
 	var commitTime uint64
-	for _, pt := range prepareResults {
+	for _, pt := range commitShards {
 		if pt > commitTime {
 			commitTime = pt
 		}
 	}
 	commitTime = r.clock.Update(commitTime)
 
-	// Phase 2: Commit
-	for shardID := range txCtx.InvolvedShards {
+	// Phase 2: Commit only shards that voted VOTE_COMMIT
+	for shardID := range commitShards {
 		info := r.topology.GetShardInfo(shardID)
 		stub, _ := r.connMgr.GetStub(info.Address)
 
@@ -272,8 +296,9 @@ func (r *Router) ensureShardStarted(ctx context.Context, txCtx *TxContext, shard
 	}
 
 	_, err = stub.TxStart(ctx, &pb.TxStartRequest{
-		TxId:         txCtx.TxID,
-		SnapshotTime: txCtx.SnapshotTime,
+		TxId:           txCtx.TxID,
+		IsolationLevel: txCtx.IsolationLevel,
+		SnapshotTime:   txCtx.SnapshotTime,
 	})
 	if err != nil {
 		return fmt.Errorf("TxStart failed on shard %s: %w", shardID, err)

@@ -21,19 +21,21 @@ type ReadRecord struct {
 
 // TxBuffer stores pending writes and read records for a single transaction.
 type TxBuffer struct {
-	txId       string
-	writes     map[string]*WriteOp    // key -> latest write op
-	writeOrder []string               // insertion order for deterministic apply
-	reads      map[string]*ReadRecord // key -> read record (external reads only)
+	txId         string
+	snapshotTime uint64                 // HLC timestamp for snapshot reads
+	writes       map[string]*WriteOp    // key -> latest write op
+	writeOrder   []string               // insertion order for deterministic apply
+	reads        map[string]*ReadRecord // key -> read record (external reads only)
 }
 
-// NewTxBuffer creates a new transaction buffer.
-func NewTxBuffer(txId string) *TxBuffer {
+// NewTxBuffer creates a new transaction buffer with snapshot time.
+func NewTxBuffer(txId string, snapshotTime uint64) *TxBuffer {
 	return &TxBuffer{
-		txId:       txId,
-		writes:     make(map[string]*WriteOp),
-		writeOrder: make([]string, 0),
-		reads:      make(map[string]*ReadRecord),
+		txId:         txId,
+		snapshotTime: snapshotTime,
+		writes:       make(map[string]*WriteOp),
+		writeOrder:   make([]string, 0),
+		reads:        make(map[string]*ReadRecord),
 	}
 }
 
@@ -109,6 +111,11 @@ func (b *TxBuffer) TxId() string {
 	return b.txId
 }
 
+// SnapshotTime returns the snapshot timestamp for this transaction.
+func (b *TxBuffer) SnapshotTime() uint64 {
+	return b.snapshotTime
+}
+
 // HasWrite checks if a key is in the write set.
 func (b *TxBuffer) HasWrite(key string) bool {
 	_, ok := b.writes[key]
@@ -128,12 +135,12 @@ func NewTxBufferManager() *TxBufferManager {
 	}
 }
 
-// Start creates a new buffer for a transaction.
-func (m *TxBufferManager) Start(txId string) *TxBuffer {
+// Start creates a new buffer for a transaction with snapshot time.
+func (m *TxBufferManager) Start(txId string, snapshotTime uint64) *TxBuffer {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	buf := NewTxBuffer(txId)
+	buf := NewTxBuffer(txId, snapshotTime)
 	m.buffers[txId] = buf
 	return buf
 }
@@ -153,18 +160,4 @@ func (m *TxBufferManager) Remove(txId string) {
 	defer m.mu.Unlock()
 
 	delete(m.buffers, txId)
-}
-
-// GetOrCreate gets existing buffer or creates a new one.
-func (m *TxBufferManager) GetOrCreate(txId string) *TxBuffer {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	if buf, ok := m.buffers[txId]; ok {
-		return buf
-	}
-
-	buf := NewTxBuffer(txId)
-	m.buffers[txId] = buf
-	return buf
 }

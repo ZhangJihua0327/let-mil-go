@@ -84,19 +84,33 @@ func (s *Shard) HlcNow() uint64 {
 }
 
 // TxStart initializes a new transaction.
-func (s *Shard) TxStart(txId string) error {
+// For PC/SI/SER: uses Update(snapshotTime) to generate snapshot timestamp.
+// For RA/CC/PSI: uses Tick() to generate snapshot timestamp.
+func (s *Shard) TxStart(txId string, isoLevel pb.IsolationLevel, snapshotTime uint64) error {
 	// Check if transaction already exists
 	if _, ok := s.bufferMgr.Get(txId); ok {
 		return ErrTxAlreadyExists
 	}
 
-	// Create buffer for this transaction
-	s.bufferMgr.Start(txId)
+	// Generate snapshot timestamp based on isolation level
+	var ts uint64
+	switch isoLevel {
+	case pb.IsolationLevel_ISOLATION_PC, pb.IsolationLevel_ISOLATION_SI, pb.IsolationLevel_ISOLATION_SER:
+		// Use external snapshot time for global consistency
+		ts = s.clock.Update(snapshotTime)
+	default:
+		// RA/CC/PSI: use local tick
+		ts = s.clock.Tick()
+	}
+
+	// Create buffer for this transaction with snapshot time
+	s.bufferMgr.Start(txId, ts)
 	return nil
 }
 
 // TxRead reads a value within a transaction context.
-func (s *Shard) TxRead(txId, key string, snapshotTime uint64) (string, uint64, bool, error) {
+// Uses the snapshot timestamp stored in the transaction buffer.
+func (s *Shard) TxRead(txId, key string) (string, uint64, bool, error) {
 	buf, ok := s.bufferMgr.Get(txId)
 	if !ok {
 		return "", 0, false, ErrTxNotFound
@@ -112,6 +126,7 @@ func (s *Shard) TxRead(txId, key string, snapshotTime uint64) (string, uint64, b
 	}
 
 	// Read from store at snapshot time (external read)
+	snapshotTime := buf.SnapshotTime()
 	value, version, _, err := s.store.Get(key, snapshotTime)
 	if err != nil {
 		if errors.Is(err, ErrKeyNotFound) || errors.Is(err, ErrVersionNotFound) {
@@ -189,12 +204,24 @@ func (s *Shard) TxDelete(txId, key string) (uint64, error) {
 func (s *Shard) Prepare(txId string, isoLevel pb.IsolationLevel) (pb.Vote, uint64, error) {
 	buf, ok := s.bufferMgr.Get(txId)
 	if !ok {
-		return pb.Vote_VOTE_ABORT, 0, ErrTxNotFound
+		return pb.Vote_VOTE_NOT_FOUND, 0, ErrTxNotFound
 	}
 
-	if len(buf.WriteOps()) == 0 && len(buf.ReadRecords()) == 0 {
-		s.abortCleanup(txId)
-		return pb.Vote_VOTE_ABORT, 0, ErrTxNoOps
+	hasWrites := len(buf.WriteOps()) > 0
+	hasReads := len(buf.ReadRecords()) > 0
+
+	// No operations at all
+	if !hasWrites && !hasReads {
+		s.cleanup(txId)
+		return pb.Vote_VOTE_NOOP, 0, nil
+	}
+
+	// No writes and reads don't need CAS validation (not SER)
+	// Can return EMPTY and skip commit phase
+	needsReadValidation := isoLevel == pb.IsolationLevel_ISOLATION_SER
+	if !hasWrites && !needsReadValidation {
+		s.cleanup(txId)
+		return pb.Vote_VOTE_NOOP, 0, nil
 	}
 
 	s.txStatusTbl.Start(txId)
@@ -211,7 +238,7 @@ func (s *Shard) Prepare(txId string, isoLevel pb.IsolationLevel) (pb.Vote, uint6
 		}
 	}
 
-	// CAS Validation
+	// CAS Validation for writes (SI and SER)
 	if isoLevel == pb.IsolationLevel_ISOLATION_SI || isoLevel == pb.IsolationLevel_ISOLATION_SER {
 		for _, op := range buf.WriteOps() {
 			_, currentVersion, _, err := s.store.GetLatest(op.Key)
@@ -227,6 +254,7 @@ func (s *Shard) Prepare(txId string, isoLevel pb.IsolationLevel) (pb.Vote, uint6
 		}
 	}
 
+	// CAS Validation for reads (SER only)
 	if isoLevel == pb.IsolationLevel_ISOLATION_SER {
 		for _, r := range buf.ReadRecords() {
 			_, currentVersion, _, err := s.store.GetLatest(r.Key)
@@ -281,6 +309,8 @@ func (s *Shard) Commit(txId string, commitTime uint64) error {
 }
 
 // Abort handles the 2PC abort phase.
+// This method can be called without prior Prepare - it will clean up any
+// existing transaction state (buffer, locks) gracefully.
 func (s *Shard) Abort(txId string) error {
 	s.abortCleanup(txId)
 	return nil

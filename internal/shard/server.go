@@ -39,7 +39,7 @@ func (s *Server) hlcNow() uint64 {
 // TxStart initializes a new transaction on this shard.
 // Creates the transaction buffer for subsequent operations.
 func (s *Server) TxStart(ctx context.Context, req *pb.TxStartRequest) (*pb.TxStartResponse, error) {
-	err := s.shard.TxStart(req.TxId)
+	err := s.shard.TxStart(req.TxId, req.IsolationLevel, req.SnapshotTime)
 	if err != nil {
 		if errors.Is(err, component.ErrTxAlreadyExists) {
 			return nil, status.Error(codes.AlreadyExists, err.Error())
@@ -52,7 +52,7 @@ func (s *Server) TxStart(ctx context.Context, req *pb.TxStartRequest) (*pb.TxSta
 // TxRead reads a value within a transaction context.
 // External reads are recorded in the buffer for SER isolation level validation.
 func (s *Server) TxRead(ctx context.Context, req *pb.TxReadRequest) (*pb.TxReadResponse, error) {
-	value, version, found, err := s.shard.TxRead(req.TxId, req.Key, req.SnapshotTime)
+	value, version, found, err := s.shard.TxRead(req.TxId, req.Key)
 	if err != nil {
 		if errors.Is(err, component.ErrTxNotFound) {
 			return nil, status.Error(codes.NotFound, "transaction not found, call TxStart first")

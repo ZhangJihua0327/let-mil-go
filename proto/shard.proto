@@ -37,7 +37,8 @@ service ShardService {
 // Transaction Start
 message TxStartRequest {
   string tx_id = 1;
-  uint64 snapshot_time = 2;  // HLC timestamp for snapshot reads
+  IsolationLevel isolation_level = 2;  // Transaction isolation level
+  uint64 snapshot_time = 3;            // Required for PC/SI/SER; ignored for RA/CC/PSI
 }
 
 message TxStartResponse {}
@@ -46,7 +47,6 @@ message TxStartResponse {}
 message TxReadRequest {
   string tx_id = 1;
   string key = 2;
-  uint64 snapshot_time = 3;  // HLC timestamp for snapshot read
 }
 
 message TxReadResponse {
@@ -94,8 +94,7 @@ message ReadRecord {
 // 2PC Prepare
 message PrepareRequest {
   string tx_id = 1;
-  uint64 snapshot_time = 2;           // Snapshot time for validation
-  IsolationLevel isolation_level = 3; // Transaction isolation level
+  IsolationLevel isolation_level = 2; // Transaction isolation level
 }
 
 message PrepareResponse {
@@ -107,6 +106,7 @@ enum Vote {
   VOTE_UNKNOWN = 0;
   VOTE_COMMIT = 1;
   VOTE_ABORT = 2;
+  VOTE_EMPTY = 3;   // No operations need commit on this shard
 }
 
 // 2PC Commit
