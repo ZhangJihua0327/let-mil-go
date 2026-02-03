@@ -20,12 +20,12 @@ type Client struct {
 }
 
 // NewClient creates a new client connection to the mulberry service
-func NewClient(addrs []string) (*Client, error) {
-	if len(addrs) == 0 {
+func NewClient(addresses []string) (*Client, error) {
+	if len(addresses) == 0 {
 		return nil, fmt.Errorf("no addresses provided")
 	}
 
-	target := fmt.Sprintf("%s:///%s", mulberryScheme, strings.Join(addrs, ","))
+	target := fmt.Sprintf("%s:///%s", mulberryScheme, strings.Join(addresses, ","))
 
 	conn, err := grpc.NewClient(
 		target,
