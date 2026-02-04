@@ -106,7 +106,8 @@ enum Vote {
   VOTE_UNKNOWN = 0;
   VOTE_COMMIT = 1;
   VOTE_ABORT = 2;
-  VOTE_EMPTY = 3;   // No operations need commit on this shard
+  VOTE_NOOP = 3;   // No operations need commit on this shard
+  VOTE_NOT_FOUND = 4;
 }
 
 // 2PC Commit
