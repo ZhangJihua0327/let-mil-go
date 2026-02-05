@@ -235,11 +235,26 @@ func (r *Router) Commit(ctx context.Context, txID string) error {
 	for shardID := range commitShards {
 		info := r.topology.GetShardInfo(shardID)
 		stub, _ := r.connMgr.GetStub(info.Address)
-
-		_, err := stub.Commit(ctx, &pb.CommitRequest{
-			TxId:       txID,
-			CommitTime: commitTime,
-		})
+		switch txCtx.IsolationLevel {
+		case pb.IsolationLevel_ISOLATION_PC, pb.IsolationLevel_ISOLATION_SI, pb.IsolationLevel_ISOLATION_SER:
+			_, err := stub.Commit(ctx, &pb.CommitRequest{
+				TxId:       txID,
+				CommitTime: commitTime,
+			})
+			if err != nil {
+				// Log error but continue - commit decision is final
+				continue
+			}
+		default:
+			_, err := stub.Commit(ctx, &pb.CommitRequest{
+				TxId:       txID,
+			})
+			if err != nil {
+				// Log error but continue - commit decision is final
+				continue
+			}
+		}
+		
 		if err != nil {
 			// Log error but continue - commit decision is final
 			continue
