@@ -2,6 +2,8 @@ package component
 
 import (
 	"sync"
+
+	pb "github.com/let-mil-go/proto/shardpb"
 )
 
 // WriteOp represents a pending write operation in the buffer.
@@ -26,13 +28,17 @@ type TxBuffer struct {
 	writes       map[string]*WriteOp    // key -> latest write op
 	writeOrder   []string               // insertion order for deterministic apply
 	reads        map[string]*ReadRecord // key -> read record (external reads only)
+	isoLevel     pb.IsolationLevel      // Isolation level for this transaction
+	startTime    uint64                 // HLC timestamp when transaction started on this shard
 }
 
 // NewTxBuffer creates a new transaction buffer with snapshot time.
-func NewTxBuffer(txId string, snapshotTime uint64) *TxBuffer {
+func NewTxBuffer(txId string, snapshotTime uint64, isoLevel pb.IsolationLevel, startTime uint64) *TxBuffer {
 	return &TxBuffer{
 		txId:         txId,
 		snapshotTime: snapshotTime,
+		isoLevel:     isoLevel,
+		startTime:    startTime,
 		writes:       make(map[string]*WriteOp),
 		writeOrder:   make([]string, 0),
 		reads:        make(map[string]*ReadRecord),
@@ -116,6 +122,16 @@ func (b *TxBuffer) SnapshotTime() uint64 {
 	return b.snapshotTime
 }
 
+// IsoLevel returns the isolation level for this transaction.
+func (b *TxBuffer) IsoLevel() pb.IsolationLevel {
+	return b.isoLevel
+}
+
+// StartTime returns the start timestamp for this transaction on this shard.
+func (b *TxBuffer) StartTime() uint64 {
+	return b.startTime
+}
+
 // HasWrite checks if a key is in the write set.
 func (b *TxBuffer) HasWrite(key string) bool {
 	_, ok := b.writes[key]
@@ -136,11 +152,11 @@ func NewTxBufferManager() *TxBufferManager {
 }
 
 // Start creates a new buffer for a transaction with snapshot time.
-func (m *TxBufferManager) Start(txId string, snapshotTime uint64) *TxBuffer {
+func (m *TxBufferManager) Start(txId string, snapshotTime uint64, isoLevel pb.IsolationLevel, startTime uint64) *TxBuffer {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	buf := NewTxBuffer(txId, snapshotTime)
+	buf := NewTxBuffer(txId, snapshotTime, isoLevel, startTime)
 	m.buffers[txId] = buf
 	return buf
 }

@@ -103,8 +103,9 @@ func (s *Shard) TxStart(txId string, isoLevel pb.IsolationLevel, snapshotTime ui
 		ts = s.clock.Tick()
 	}
 
-	// Create buffer for this transaction with snapshot time
-	s.bufferMgr.Start(txId, ts)
+	// Create buffer for this transaction with snapshot time and isolation level
+	startTime := s.clock.Now()
+	s.bufferMgr.Start(txId, ts, isoLevel, startTime)
 	return nil
 }
 
@@ -281,14 +282,15 @@ func (s *Shard) Prepare(txId string, isoLevel pb.IsolationLevel) (pb.Vote, uint6
 
 // Commit handles the 2PC commit phase.
 func (s *Shard) Commit(txId string, commitTime uint64) error {
+
+	buf, ok := s.bufferMgr.Get(txId)
+	if !ok {
+		return ErrTxNotFound
+	}
 	if commitTime == 0 {
 		commitTime = s.HlcTick()
 	} else {
 		commitTime = s.HlcUpdate(commitTime)
-	}
-	buf, ok := s.bufferMgr.Get(txId)
-	if !ok {
-		return ErrTxNotFound
 	}
 
 	for _, op := range buf.WriteOps() {
