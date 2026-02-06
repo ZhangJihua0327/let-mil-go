@@ -53,13 +53,27 @@ func main() {
 
 	// Start topology sync with CSRS if address provided
 	var cancelSync context.CancelFunc
+	var routerID string
 	if *csrsAddr != "" {
 		var ctx context.Context
 		ctx, cancelSync = context.WithCancel(context.Background())
+
+		// Register router with CSRS to get unique router ID
+		var err error
+		routerID, err = registerRouter(*csrsAddr, fmt.Sprintf(":%d", *port))
+		if err != nil {
+			log.Fatalf("failed to register router with CSRS: %v", err)
+		}
+		log.Printf("Registered with CSRS, router ID: %s", routerID)
+
 		go syncTopology(ctx, *csrsAddr, topology, *syncInterval)
+	} else {
+		// Standalone mode: generate local router ID
+		routerID = fmt.Sprintf("router_standalone_%d", time.Now().UnixNano())
+		log.Printf("Running in standalone mode, router ID: %s", routerID)
 	}
 
-	router := mulberry.NewRouter(topology)
+	router := mulberry.NewRouter(routerID, topology)
 	server := mulberry.NewServer(router)
 
 	addr := fmt.Sprintf(":%d", *port)
@@ -170,4 +184,26 @@ func doSync(csrsAddr string, topology *csrs.TopologyManager) error {
 	}
 
 	return nil
+}
+
+func registerRouter(csrsAddr string, routerAddr string) (string, error) {
+	conn, err := grpc.NewClient(csrsAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		return "", fmt.Errorf("failed to connect to CSRS: %w", err)
+	}
+	defer conn.Close()
+
+	client := csrspb.NewCSRSServiceClient(conn)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	resp, err := client.RegisterRouter(ctx, &csrspb.RegisterRouterRequest{
+		Address: routerAddr,
+	})
+	if err != nil {
+		return "", fmt.Errorf("RegisterRouter failed: %w", err)
+	}
+
+	return resp.RouterId, nil
 }

@@ -95,3 +95,24 @@ func (s *Server) BumpTopologyVersion(ctx context.Context, req *pb.BumpTopologyVe
 	version := s.tm.BumpTopologyVersion()
 	return &pb.BumpTopologyVersionResponse{TopologyVersion: version}, nil
 }
+
+// RegisterRouter registers a new router and returns a unique router ID.
+func (s *Server) RegisterRouter(ctx context.Context, req *pb.RegisterRouterRequest) (*pb.RegisterRouterResponse, error) {
+	routerID, version, err := s.tm.RegisterRouter(req.Address)
+	if err != nil {
+		return nil, err
+	}
+	return &pb.RegisterRouterResponse{
+		RouterId:        routerID,
+		TopologyVersion: version,
+	}, nil
+}
+
+// UnregisterRouter removes a router from the registry.
+func (s *Server) UnregisterRouter(ctx context.Context, req *pb.UnregisterRouterRequest) (*pb.UnregisterRouterResponse, error) {
+	version, err := s.tm.UnregisterRouter(req.RouterId)
+	if err != nil {
+		return nil, err
+	}
+	return &pb.UnregisterRouterResponse{TopologyVersion: version}, nil
+}

@@ -27,6 +27,12 @@ service CSRSService {
 
   // BumpTopologyVersion manually increments the topology version.
   rpc BumpTopologyVersion(BumpTopologyVersionRequest) returns (BumpTopologyVersionResponse);
+
+  // RegisterRouter registers a new router and returns a unique router ID.
+  rpc RegisterRouter(RegisterRouterRequest) returns (RegisterRouterResponse);
+
+  // UnregisterRouter removes a router from the registry.
+  rpc UnregisterRouter(UnregisterRouterRequest) returns (UnregisterRouterResponse);
 }
 
 // ShardStatus represents the operational status of a shard.
@@ -97,5 +103,24 @@ message UpdateShardStatusResponse {
 message BumpTopologyVersionRequest {}
 
 message BumpTopologyVersionResponse {
+  uint64 topology_version = 1;
+}
+
+// RegisterRouter
+message RegisterRouterRequest {
+  string address = 1;  // router's ip:port
+}
+
+message RegisterRouterResponse {
+  string router_id = 1;          // unique router ID assigned by CSRS
+  uint64 topology_version = 2;   // current topology version
+}
+
+// UnregisterRouter
+message UnregisterRouterRequest {
+  string router_id = 1;
+}
+
+message UnregisterRouterResponse {
   uint64 topology_version = 1;
 }

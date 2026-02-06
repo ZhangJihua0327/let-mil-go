@@ -14,6 +14,7 @@ import (
 // Router implements mongos-like functionality for the distributed database.
 // It routes client requests to appropriate shards and coordinates transactions.
 type Router struct {
+	routerID        string
 	connMgr         *ShardConnectionManager
 	topology        *csrs.TopologyManager
 	clock           *hlc.Clock
@@ -30,14 +31,20 @@ type TxContext struct {
 	InvolvedShards map[string]bool // shardID -> participated
 }
 
-// NewRouter creates a new Router instance.
-func NewRouter(topology *csrs.TopologyManager) *Router {
+// NewRouter creates a new Router instance with the given router ID.
+func NewRouter(routerID string, topology *csrs.TopologyManager) *Router {
 	return &Router{
+		routerID:   routerID,
 		connMgr:    NewShardConnectionManager(),
 		topology:   topology,
 		clock:      hlc.GetClock(),
 		activeTxns: make(map[string]*TxContext),
 	}
+}
+
+// GetRouterID returns the router's unique ID assigned by CSRS.
+func (r *Router) GetRouterID() string {
+	return r.routerID
 }
 
 // StartTransaction starts a new distributed transaction.

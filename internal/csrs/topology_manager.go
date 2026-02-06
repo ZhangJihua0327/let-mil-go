@@ -2,9 +2,16 @@ package csrs
 
 import (
 	"fmt"
-	"github.com/let-mil-go/internal/hlc"
 	"sync"
+
+	"github.com/let-mil-go/internal/hlc"
 )
+
+// RouterInfo holds metadata about a registered router.
+type RouterInfo struct {
+	RouterID string
+	Address  string
+}
 
 // TopologyManager is the central component for managing cluster topology.
 // It acts as the Config Server (source of truth) similar to MongoDB's CSRS.
@@ -14,6 +21,8 @@ type TopologyManager struct {
 	hashRing        *HashRing
 	topologyVersion uint64
 	clock           *hlc.Clock
+	routers         map[string]*RouterInfo // routerID -> RouterInfo
+	nextRouterID    uint64
 }
 
 // NewTopologyManager creates a new TopologyManager instance.
@@ -22,6 +31,7 @@ func NewTopologyManager() *TopologyManager {
 		registry: NewShardRegistry(),
 		hashRing: NewHashRing(),
 		clock:    hlc.GetClock(),
+		routers:  make(map[string]*RouterInfo),
 	}
 }
 
@@ -31,6 +41,7 @@ func NewTopologyManagerWithClock(clock *hlc.Clock) *TopologyManager {
 		registry: NewShardRegistry(),
 		hashRing: NewHashRing(),
 		clock:    clock,
+		routers:  make(map[string]*RouterInfo),
 	}
 }
 
@@ -222,4 +233,57 @@ func (tm *TopologyManager) BumpTopologyVersion() uint64 {
 // Must be called with tm.mu held.
 func (tm *TopologyManager) incrementVersion() {
 	tm.topologyVersion = tm.clock.Tick()
+}
+
+// RegisterRouter registers a new router and returns a unique router ID.
+func (tm *TopologyManager) RegisterRouter(address string) (string, uint64, error) {
+	tm.mu.Lock()
+	defer tm.mu.Unlock()
+
+	if address == "" {
+		return "", tm.topologyVersion, fmt.Errorf("router address cannot be empty")
+	}
+
+	tm.nextRouterID++
+	routerID := fmt.Sprintf("router_%d", tm.nextRouterID)
+
+	tm.routers[routerID] = &RouterInfo{
+		RouterID: routerID,
+		Address:  address,
+	}
+
+	return routerID, tm.topologyVersion, nil
+}
+
+// UnregisterRouter removes a router from the registry.
+func (tm *TopologyManager) UnregisterRouter(routerID string) (uint64, error) {
+	tm.mu.Lock()
+	defer tm.mu.Unlock()
+
+	if _, exists := tm.routers[routerID]; !exists {
+		return tm.topologyVersion, fmt.Errorf("router %s not found", routerID)
+	}
+
+	delete(tm.routers, routerID)
+	return tm.topologyVersion, nil
+}
+
+// GetRouterInfo returns the info for a registered router.
+func (tm *TopologyManager) GetRouterInfo(routerID string) *RouterInfo {
+	tm.mu.RLock()
+	defer tm.mu.RUnlock()
+
+	return tm.routers[routerID]
+}
+
+// GetAllRouters returns all registered routers.
+func (tm *TopologyManager) GetAllRouters() map[string]*RouterInfo {
+	tm.mu.RLock()
+	defer tm.mu.RUnlock()
+
+	result := make(map[string]*RouterInfo, len(tm.routers))
+	for id, info := range tm.routers {
+		result[id] = info
+	}
+	return result
 }
