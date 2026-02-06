@@ -14,13 +14,14 @@ import (
 // Router implements mongos-like functionality for the distributed database.
 // It routes client requests to appropriate shards and coordinates transactions.
 type Router struct {
-	routerID        string
-	connMgr         *ShardConnectionManager
-	topology        *csrs.TopologyManager
-	clock           *hlc.Clock
-	activeTxns      map[string]*TxContext
-	mu              sync.RWMutex
-	topologyVersion uint64
+	routerID            string
+	connMgr             *ShardConnectionManager
+	topology            *csrs.TopologyManager
+	clock               *hlc.Clock
+	activeTxns          map[string]*TxContext
+	mu                  sync.RWMutex
+	topologyVersion     uint64
+	shardLastCommitTime sync.Map // shardID -> uint64 (last commit time)
 }
 
 // TxContext holds the state of an active transaction.
@@ -48,20 +49,20 @@ func (r *Router) GetRouterID() string {
 }
 
 // StartTransaction starts a new distributed transaction.
-// It generates a new TxID by calling the CSRS version increment.
+// It generates a new TxID using format Tx_{routerID}_{timestamp}.
 func (r *Router) StartTransaction(ctx context.Context, isolationLevel pb.IsolationLevel) (string, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	// Generate TxID using CSRS version increment
-	version := r.topology.BumpTopologyVersion()
-	txID := fmt.Sprintf("tx_%d", version)
+	// Generate TxID using format Tx_{routerID}_{timestamp}
+	timestamp := r.clock.Tick()
+	txID := fmt.Sprintf("Tx_%s_%d", r.routerID, timestamp)
 
 	if _, exists := r.activeTxns[txID]; exists {
 		return "", fmt.Errorf("transaction %s already exists", txID)
 	}
 
-	snapshotTime := r.clock.Tick()
+	snapshotTime := timestamp
 
 	r.activeTxns[txID] = &TxContext{
 		TxID:           txID,
@@ -209,13 +210,18 @@ func (r *Router) quickCommit(ctx context.Context, txID string, txCtx *TxContext)
 		return fmt.Errorf("failed to get stub for QuickCommit: %w", err)
 	}
 
-	_, err = stub.QuickCommit(ctx, &pb.QuickCommitRequest{
+	resp, err := stub.QuickCommit(ctx, &pb.QuickCommitRequest{
 		TxId:           txID,
 		IsolationLevel: txCtx.IsolationLevel,
 	})
 	if err != nil {
 		r.removeTxContext(txID)
 		return fmt.Errorf("QuickCommit failed on shard %s: %w", shardID, err)
+	}
+
+	// Update shard's last commit time (thread-safe)
+	if resp.CommitTime > 0 {
+		r.updateShardLastCommitTime(shardID, resp.CommitTime)
 	}
 
 	r.removeTxContext(txID)
@@ -289,25 +295,23 @@ func (r *Router) twoPhaseCommit(ctx context.Context, txID string, txCtx *TxConte
 	for shardID := range commitShards {
 		info := r.topology.GetShardInfo(shardID)
 		stub, _ := r.connMgr.GetStub(info.Address)
+		var commitErr error
 		switch txCtx.IsolationLevel {
 		case pb.IsolationLevel_ISOLATION_PC, pb.IsolationLevel_ISOLATION_SI, pb.IsolationLevel_ISOLATION_SER:
-			_, err := stub.Commit(ctx, &pb.CommitRequest{
+			_, commitErr = stub.Commit(ctx, &pb.CommitRequest{
 				TxId:       txID,
 				CommitTime: commitTime,
 			})
-			if err != nil {
-				// Log error but continue - commit decision is final
-				continue
-			}
 		default:
-			_, err := stub.Commit(ctx, &pb.CommitRequest{
+			_, commitErr = stub.Commit(ctx, &pb.CommitRequest{
 				TxId: txID,
 			})
-			if err != nil {
-				// Log error but continue - commit decision is final
-				continue
-			}
 		}
+		if commitErr == nil {
+			// Update shard's last commit time on successful commit (thread-safe)
+			r.updateShardLastCommitTime(shardID, commitTime)
+		}
+		// Log error but continue - commit decision is final
 	}
 
 	r.removeTxContext(txID)
@@ -408,4 +412,44 @@ func (r *Router) abortAll(ctx context.Context, txID string, txCtx *TxContext) {
 	}
 
 	r.removeTxContext(txID)
+}
+
+// updateShardLastCommitTime updates the last commit time for a shard.
+// Uses sync.Map for thread-safe updates without locking.
+// Only updates if the new commitTime is greater than the existing one.
+func (r *Router) updateShardLastCommitTime(shardID string, commitTime uint64) {
+	for {
+		oldVal, loaded := r.shardLastCommitTime.Load(shardID)
+		if loaded {
+			oldTime := oldVal.(uint64)
+			if commitTime <= oldTime {
+				// Current time is not newer, no update needed
+				return
+			}
+		}
+		// Try to store the new value
+		if !loaded {
+			// First time storing for this shard
+			if r.shardLastCommitTime.CompareAndSwap(shardID, nil, commitTime) {
+				return
+			}
+			// Someone else stored first, retry
+			r.shardLastCommitTime.Store(shardID, commitTime)
+			return
+		}
+		// Update existing value
+		if r.shardLastCommitTime.CompareAndSwap(shardID, oldVal, commitTime) {
+			return
+		}
+		// CAS failed, retry
+	}
+}
+
+// GetShardLastCommitTime returns the last commit time for a shard.
+// Returns 0 if the shard has no recorded commits.
+func (r *Router) GetShardLastCommitTime(shardID string) uint64 {
+	if val, ok := r.shardLastCommitTime.Load(shardID); ok {
+		return val.(uint64)
+	}
+	return 0
 }
