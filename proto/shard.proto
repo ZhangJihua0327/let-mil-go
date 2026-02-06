@@ -33,6 +33,9 @@ service ShardService {
   // Single-shard fast commit (no 2PC)
   rpc QuickCommit(QuickCommitRequest) returns (QuickCommitResponse);
 
+  // Single-shard abort (no 2PC)
+  rpc QuickAbort(QuickAbortRequest) returns (QuickAbortResponse);
+
   // Shard metadata
   rpc GetCurrentTime(GetCurrentTimeRequest) returns (GetCurrentTimeResponse);
 }
@@ -41,15 +44,19 @@ service ShardService {
 message TxStartRequest {
   string tx_id = 1;
   IsolationLevel isolation_level = 2;  // Transaction isolation level
-  uint64 snapshot_time = 3;            // Required for PC/SI/SER; ignored for RA/CC/PSI
+  uint64 snapshot_time = 3;            // Required for PC/SI/SER; ignored for PSI
 }
 
-message TxStartResponse {}
+message TxStartResponse {
+  uint64 start_time = 1;  // Local start time on this shard (for lazy buffer creation)
+}
 
 // Transaction Read
 message TxReadRequest {
   string tx_id = 1;
   string key = 2;
+  uint64 snapshot_time = 3;            // Snapshot time for this shard (from TxStartResponse)
+  IsolationLevel isolation_level = 4;  // Transaction isolation level
 }
 
 message TxReadResponse {
@@ -63,6 +70,8 @@ message TxWriteRequest {
   string tx_id = 1;
   string key = 2;
   string value = 3;
+  uint64 snapshot_time = 4;            // Snapshot time for this shard (from TxStartResponse)
+  IsolationLevel isolation_level = 5;  // Transaction isolation level
 }
 
 message TxWriteResponse {
@@ -73,6 +82,8 @@ message TxWriteResponse {
 message TxDeleteRequest {
   string tx_id = 1;
   string key = 2;
+  uint64 snapshot_time = 3;            // Snapshot time for this shard (from TxStartResponse)
+  IsolationLevel isolation_level = 4;  // Transaction isolation level
 }
 
 message TxDeleteResponse {
@@ -119,7 +130,9 @@ message CommitRequest {
   uint64 commit_time = 2;  // Final commit HLC timestamp
 }
 
-message CommitResponse {}
+message CommitResponse {
+  uint64 commit_time = 1;  // Local commit HLC timestamp on this shard
+}
 
 // 2PC Abort
 message AbortRequest {
@@ -137,6 +150,13 @@ message QuickCommitRequest {
 message QuickCommitResponse {
   uint64 commit_time = 1;  // Commit HLC timestamp
 }
+
+// Single-shard QuickAbort (no 2PC)
+message QuickAbortRequest {
+  string tx_id = 1;
+}
+
+message QuickAbortResponse {}
 
 // Shard current time
 message GetCurrentTimeRequest {}

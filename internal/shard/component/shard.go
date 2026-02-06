@@ -9,9 +9,10 @@ import (
 )
 
 var (
-	ErrTxAlreadyExists = errors.New("transaction already exists")
-	ErrTxNotFound      = errors.New("transaction not found")
-	ErrTxNoOps         = errors.New("transaction has no operations")
+	ErrTxAlreadyExists           = errors.New("transaction already exists")
+	ErrTxNotFound                = errors.New("transaction not found")
+	ErrTxNoOps                   = errors.New("transaction has no operations")
+	ErrUnsupportedIsolationLevel = errors.New("unsupported isolation level")
 )
 
 // Shard represents a single data shard in the distributed database.
@@ -61,42 +62,43 @@ func (s *Shard) HlcNow() uint64 {
 	return s.clock.Now()
 }
 
-// TxStart initializes a new transaction.
-// For PC/SI/SER: uses Update(snapshotTime) to generate snapshot timestamp.
-// For RA/CC/PSI: uses Tick() to generate snapshot timestamp.
-func (s *Shard) TxStart(txId string, isoLevel pb.IsolationLevel, snapshotTime uint64) error {
-	// Check if transaction already exists
-	if _, ok := s.bufferMgr.Get(txId); ok {
-		return ErrTxAlreadyExists
+// TxStart initializes a new transaction and returns the local start time.
+// For PC/SI/SER: uses Update(snapshotTime) to generate snapshot timestamp from router's global time.
+// For PSI: uses Tick() to generate snapshot timestamp locally.
+// For RA/CC: returns ErrUnsupportedIsolationLevel (not supported).
+// Note: TxBuffer is NOT created here - it will be lazily created on first read/write operation.
+func (s *Shard) TxStart(txId string, isoLevel pb.IsolationLevel, snapshotTime uint64) (uint64, error) {
+	// Reject unsupported isolation levels (RA and CC)
+	if isoLevel == pb.IsolationLevel_ISOLATION_RA || isoLevel == pb.IsolationLevel_ISOLATION_CC {
+		return 0, ErrUnsupportedIsolationLevel
 	}
 
 	// Generate snapshot timestamp based on isolation level
 	var ts uint64
 	switch isoLevel {
 	case pb.IsolationLevel_ISOLATION_PC, pb.IsolationLevel_ISOLATION_SI, pb.IsolationLevel_ISOLATION_SER:
-		// Use external snapshot time for global consistency
+		// Use external snapshot time from router for global consistency
 		ts = s.clock.Update(snapshotTime)
-	default:
-		// RA/CC/PSI: use local tick
+	case pb.IsolationLevel_ISOLATION_PSI:
+		// PSI: use local tick for parallel snapshot isolation
 		ts = s.clock.Tick()
+	default:
+		return 0, ErrUnsupportedIsolationLevel
 	}
 
-	// Create buffer for this transaction with snapshot time and isolation level
-	s.bufferMgr.Start(txId, ts, isoLevel, s.clock.Now())
-	return nil
+	// Return start time - buffer will be created lazily on first operation
+	return ts, nil
 }
 
 // TxRead reads a value within a transaction context.
-// Uses the snapshot timestamp stored in the transaction buffer.
+// Uses the provided snapshot timestamp (from router's TxStart response).
 // If there's a pending write with prepareTime > snapshotTime, the read can skip
 // the pending version and read older committed data (optimized for old snapshot reads).
 // If snapshotTime >= prepareTime of a pending version, the read will be blocked (returns error).
 // For SER isolation level, acquires read lock immediately to prevent conflicts.
-func (s *Shard) TxRead(txId, key string) (string, uint64, bool, error) {
-	buf, ok := s.bufferMgr.Get(txId)
-	if !ok {
-		return "", 0, false, ErrTxNotFound
-	}
+// TxBuffer is lazily created if not exists.
+func (s *Shard) TxRead(txId, key string, snapshotTime uint64, isoLevel pb.IsolationLevel) (string, uint64, bool, error) {
+	buf := s.getOrCreateBuffer(txId, snapshotTime, isoLevel)
 
 	// Check write buffer first (internal read)
 	if op, found := buf.GetWrite(key); found {
@@ -108,7 +110,7 @@ func (s *Shard) TxRead(txId, key string) (string, uint64, bool, error) {
 	}
 
 	// For SER isolation level, acquire read lock immediately (pessimistic locking)
-	if buf.IsoLevel() == pb.IsolationLevel_ISOLATION_SER {
+	if isoLevel == pb.IsolationLevel_ISOLATION_SER {
 		if err := s.lockMgr.AcquireRead(txId, key); err != nil {
 			return "", 0, false, err
 		}
@@ -118,14 +120,13 @@ func (s *Shard) TxRead(txId, key string) (string, uint64, bool, error) {
 	// Handles pending versions:
 	// - If snapshotTime < prepareTime: skip pending, read older version
 	// - If snapshotTime >= prepareTime: return ErrPendingRead (caller should retry/wait)
-	snapshotTime := buf.SnapshotTime()
 	value, version, _, err := s.store.Get(key, snapshotTime)
 	if err != nil {
 		if err == ErrPendingRead {
 			// The read is blocked by a pending write, caller should retry
 			return "", 0, false, err
 		}
-		if buf.IsoLevel() == pb.IsolationLevel_ISOLATION_SER {
+		if isoLevel == pb.IsolationLevel_ISOLATION_SER {
 			// Record external read even if not found (for tracking purposes)
 			buf.RecordRead(key, 0, false)
 		}
@@ -133,7 +134,7 @@ func (s *Shard) TxRead(txId, key string) (string, uint64, bool, error) {
 	}
 
 	// Record external read for SER isolation level (for tracking, not for validation)
-	if buf.IsoLevel() == pb.IsolationLevel_ISOLATION_SER {
+	if isoLevel == pb.IsolationLevel_ISOLATION_SER {
 		buf.RecordRead(key, version, true)
 	}
 	s.oplog.Append(&OpEntry{
@@ -149,14 +150,12 @@ func (s *Shard) TxRead(txId, key string) (string, uint64, bool, error) {
 
 // TxWrite buffers a write operation.
 // For SER isolation level, acquires write lock immediately to prevent conflicts.
-func (s *Shard) TxWrite(txId, key, value string) (uint64, error) {
-	buf, ok := s.bufferMgr.Get(txId)
-	if !ok {
-		return 0, ErrTxNotFound
-	}
+// TxBuffer is lazily created if not exists.
+func (s *Shard) TxWrite(txId, key, value string, snapshotTime uint64, isoLevel pb.IsolationLevel) (uint64, error) {
+	buf := s.getOrCreateBuffer(txId, snapshotTime, isoLevel)
 
 	// For SER isolation level, acquire write lock immediately (pessimistic locking)
-	if buf.IsoLevel() == pb.IsolationLevel_ISOLATION_SER {
+	if isoLevel == pb.IsolationLevel_ISOLATION_SER {
 		if err := s.lockMgr.AcquireWrite(txId, key); err != nil {
 			return 0, err
 		}
@@ -164,9 +163,9 @@ func (s *Shard) TxWrite(txId, key, value string) (uint64, error) {
 
 	var version uint64 = 0
 	var err error = nil
-	switch buf.IsoLevel() {
+	switch isoLevel {
 	case pb.IsolationLevel_ISOLATION_SI, pb.IsolationLevel_ISOLATION_SER:
-		_, version, _, err = s.store.Get(key, buf.SnapshotTime())
+		_, version, _, err = s.store.Get(key, snapshotTime)
 	default:
 		_, version, _, err = s.store.GetLatest(key)
 	}
@@ -188,14 +187,12 @@ func (s *Shard) TxWrite(txId, key, value string) (uint64, error) {
 
 // TxDelete buffers a delete operation.
 // For SER isolation level, acquires write lock immediately to prevent conflicts.
-func (s *Shard) TxDelete(txId, key string) (uint64, error) {
-	buf, ok := s.bufferMgr.Get(txId)
-	if !ok {
-		return 0, ErrTxNotFound
-	}
+// TxBuffer is lazily created if not exists.
+func (s *Shard) TxDelete(txId, key string, snapshotTime uint64, isoLevel pb.IsolationLevel) (uint64, error) {
+	buf := s.getOrCreateBuffer(txId, snapshotTime, isoLevel)
 
 	// For SER isolation level, acquire write lock immediately (pessimistic locking)
-	if buf.IsoLevel() == pb.IsolationLevel_ISOLATION_SER {
+	if isoLevel == pb.IsolationLevel_ISOLATION_SER {
 		if err := s.lockMgr.AcquireWrite(txId, key); err != nil {
 			return 0, err
 		}
@@ -203,9 +200,9 @@ func (s *Shard) TxDelete(txId, key string) (uint64, error) {
 
 	var version uint64 = 0
 	var err error = nil
-	switch buf.IsoLevel() {
+	switch isoLevel {
 	case pb.IsolationLevel_ISOLATION_SI, pb.IsolationLevel_ISOLATION_SER:
-		_, version, _, err = s.store.Get(key, buf.SnapshotTime())
+		_, version, _, err = s.store.Get(key, snapshotTime)
 	default:
 		_, version, _, err = s.store.GetLatest(key)
 	}
@@ -271,8 +268,9 @@ func (s *Shard) Prepare(txId string) (pb.Vote, uint64, error) {
 		}
 	}
 
-	// CAS Validation for writes (SI and SER)
-	if buf.IsoLevel() == pb.IsolationLevel_ISOLATION_SI || buf.IsoLevel() == pb.IsolationLevel_ISOLATION_SER {
+	// CAS Validation for writes (PSI, SI and SER)
+	// PSI/SI: use optimistic locking - verify the version being overwritten is still the original version
+	if buf.IsoLevel() == pb.IsolationLevel_ISOLATION_PSI || buf.IsoLevel() == pb.IsolationLevel_ISOLATION_SI || buf.IsoLevel() == pb.IsolationLevel_ISOLATION_SER {
 		for _, op := range buf.WriteOps() {
 			_, currentVersion, _, err := s.store.GetLatest(op.Key)
 			if err != nil {
@@ -311,11 +309,12 @@ func (s *Shard) Prepare(txId string) (pb.Vote, uint64, error) {
 
 // Commit handles the 2PC commit phase.
 // It confirms pending data in the MVCC store with the commit time and releases locks.
-func (s *Shard) Commit(txId string, commitTime uint64) error {
+// Returns the local commit time on this shard.
+func (s *Shard) Commit(txId string, commitTime uint64) (uint64, error) {
 
 	_, ok := s.bufferMgr.Get(txId)
 	if !ok {
-		return ErrTxNotFound
+		return 0, ErrTxNotFound
 	}
 	if commitTime == 0 {
 		commitTime = s.HlcTick()
@@ -337,7 +336,7 @@ func (s *Shard) Commit(txId string, commitTime uint64) error {
 		OpType:    OpTypeCommit,
 	})
 
-	return nil
+	return commitTime, nil
 }
 
 // QuickCommit handles single-shard transactions without 2PC overhead.
@@ -388,8 +387,9 @@ func (s *Shard) QuickCommit(txId string, isoLevel pb.IsolationLevel) (uint64, er
 		}
 	}
 
-	// CAS Validation for writes (SI and SER)
-	if buf.IsoLevel() == pb.IsolationLevel_ISOLATION_SI || buf.IsoLevel() == pb.IsolationLevel_ISOLATION_SER {
+	// CAS Validation for writes (PSI, SI and SER)
+	// PSI/SI: use optimistic locking - verify the version being overwritten is still the original version
+	if buf.IsoLevel() == pb.IsolationLevel_ISOLATION_PSI || buf.IsoLevel() == pb.IsolationLevel_ISOLATION_SI || buf.IsoLevel() == pb.IsolationLevel_ISOLATION_SER {
 		for _, op := range buf.WriteOps() {
 			_, currentVersion, _, err := s.store.GetLatest(op.Key)
 			if err != nil {
@@ -442,6 +442,24 @@ func (s *Shard) Abort(txId string) error {
 	return nil
 }
 
+// QuickAbort handles abort for single-shard transactions without 2PC.
+// Unlike Abort, it doesn't need to handle pending MVCC data since QuickCommit
+// writes directly to the store (not as pending).
+// This is a simplified version for the fast path.
+func (s *Shard) QuickAbort(txId string) error {
+	// Just cleanup buffer and locks, no pending data to remove
+	s.cleanup(txId)
+	s.txStatusTbl.Abort(txId)
+	s.oplog.Append(&OpEntry{
+		Timestamp: s.HlcTick(),
+		TxId:      txId,
+		Key:       "",
+		Value:     "",
+		OpType:    OpTypeAbort,
+	})
+	return nil
+}
+
 func (s *Shard) abortCleanup(txId string) {
 	// Remove pending writes from MVCC store before releasing locks
 	s.store.RemovePending(txId)
@@ -459,4 +477,12 @@ func (s *Shard) abortCleanup(txId string) {
 func (s *Shard) cleanup(txId string) {
 	s.lockMgr.Release(txId)
 	s.bufferMgr.Remove(txId)
+}
+
+// getOrCreateBuffer returns existing buffer or creates a new one lazily.
+func (s *Shard) getOrCreateBuffer(txId string, snapshotTime uint64, isoLevel pb.IsolationLevel) *TxBuffer {
+	if buf, ok := s.bufferMgr.Get(txId); ok {
+		return buf
+	}
+	return s.bufferMgr.Start(txId, snapshotTime, isoLevel, s.clock.Now())
 }

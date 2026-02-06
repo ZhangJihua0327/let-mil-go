@@ -16,18 +16,26 @@ func TestSingleTransactionSuccess(t *testing.T) {
 	txId := "tx-1"
 	key := "key-1"
 	value := "value-1"
+	isoLevel := pb.IsolationLevel_ISOLATION_SI
 
 	// 0. Start Tx
-	_, err := s.TxStart(ctx, &pb.TxStartRequest{TxId: txId})
+	startResp, err := s.TxStart(ctx, &pb.TxStartRequest{
+		TxId:           txId,
+		IsolationLevel: isoLevel,
+		SnapshotTime:   s.hlcNow(),
+	})
 	if err != nil {
 		t.Fatalf("TxStart failed: %v", err)
 	}
+	snapshotTime := startResp.StartTime
 
 	// 1. Write
 	_, err = s.TxWrite(ctx, &pb.TxWriteRequest{
-		TxId:  txId,
-		Key:   key,
-		Value: value,
+		TxId:           txId,
+		Key:            key,
+		Value:          value,
+		SnapshotTime:   snapshotTime,
+		IsolationLevel: isoLevel,
 	})
 	if err != nil {
 		t.Fatalf("TxWrite failed: %v", err)
@@ -36,7 +44,7 @@ func TestSingleTransactionSuccess(t *testing.T) {
 	// 2. Prepare
 	prepResp, err := s.Prepare(ctx, &pb.PrepareRequest{
 		TxId:           txId,
-		IsolationLevel: pb.IsolationLevel_ISOLATION_SI,
+		IsolationLevel: isoLevel,
 	})
 	if err != nil {
 		t.Fatalf("Prepare failed: %v", err)
@@ -58,14 +66,21 @@ func TestSingleTransactionSuccess(t *testing.T) {
 	// 4. Verify Data
 	// Read via new transaction
 	verifyTxId := "tx-verify"
-	_, err = s.TxStart(ctx, &pb.TxStartRequest{TxId: verifyTxId})
+	verifyStartResp, err := s.TxStart(ctx, &pb.TxStartRequest{
+		TxId:           verifyTxId,
+		IsolationLevel: isoLevel,
+		SnapshotTime:   s.hlcNow(),
+	})
 	if err != nil {
 		t.Fatalf("Verify TxStart failed: %v", err)
 	}
+	verifySnapshotTime := verifyStartResp.StartTime
 
 	readResp, err := s.TxRead(ctx, &pb.TxReadRequest{
-		TxId: verifyTxId,
-		Key:  key,
+		TxId:           verifyTxId,
+		Key:            key,
+		SnapshotTime:   verifySnapshotTime,
+		IsolationLevel: isoLevel,
 	})
 	if err != nil {
 		t.Fatalf("TxRead failed: %v", err)
@@ -87,18 +102,26 @@ func TestConcurrentTransactionsConflict(t *testing.T) {
 	ctx := context.Background()
 
 	key := "shared-key"
+	isoLevel := pb.IsolationLevel_ISOLATION_SI
 
 	// T1 starts first
 	tx1 := "tx-1"
-	_, err := s.TxStart(ctx, &pb.TxStartRequest{TxId: tx1})
+	tx1StartResp, err := s.TxStart(ctx, &pb.TxStartRequest{
+		TxId:           tx1,
+		IsolationLevel: isoLevel,
+		SnapshotTime:   s.hlcNow(),
+	})
 	if err != nil {
 		t.Fatalf("Tx1 Start failed: %v", err)
 	}
+	tx1SnapshotTime := tx1StartResp.StartTime
 
 	_, err = s.TxWrite(ctx, &pb.TxWriteRequest{
-		TxId:  tx1,
-		Key:   key,
-		Value: "val-1",
+		TxId:           tx1,
+		Key:            key,
+		Value:          "val-1",
+		SnapshotTime:   tx1SnapshotTime,
+		IsolationLevel: isoLevel,
 	})
 	if err != nil {
 		t.Fatalf("Tx1 Write failed: %v", err)
@@ -106,15 +129,22 @@ func TestConcurrentTransactionsConflict(t *testing.T) {
 
 	// T2 starts later (after T1 writes)
 	tx2 := "tx-2"
-	_, err = s.TxStart(ctx, &pb.TxStartRequest{TxId: tx2})
+	tx2StartResp, err := s.TxStart(ctx, &pb.TxStartRequest{
+		TxId:           tx2,
+		IsolationLevel: isoLevel,
+		SnapshotTime:   s.hlcNow(),
+	})
 	if err != nil {
 		t.Fatalf("Tx2 Start failed: %v", err)
 	}
+	tx2SnapshotTime := tx2StartResp.StartTime
 
 	_, err = s.TxWrite(ctx, &pb.TxWriteRequest{
-		TxId:  tx2,
-		Key:   key, // Same key conflict
-		Value: "val-2",
+		TxId:           tx2,
+		Key:            key, // Same key conflict
+		Value:          "val-2",
+		SnapshotTime:   tx2SnapshotTime,
+		IsolationLevel: isoLevel,
 	})
 	if err != nil {
 		t.Fatalf("Tx2 Write failed: %v", err)
@@ -126,7 +156,7 @@ func TestConcurrentTransactionsConflict(t *testing.T) {
 	// T1 Prepare (Acquires Lock)
 	prepResp1, err := s.Prepare(ctx, &pb.PrepareRequest{
 		TxId:           tx1,
-		IsolationLevel: pb.IsolationLevel_ISOLATION_SI,
+		IsolationLevel: isoLevel,
 	})
 	if err != nil {
 		t.Fatalf("Tx1 Prepare failed: %v", err)
@@ -140,7 +170,7 @@ func TestConcurrentTransactionsConflict(t *testing.T) {
 
 	prepResp2, err := s.Prepare(ctx, &pb.PrepareRequest{
 		TxId:           tx2,
-		IsolationLevel: pb.IsolationLevel_ISOLATION_SI,
+		IsolationLevel: isoLevel,
 	})
 
 	// Expecting failure or Abort Vote due to Lock Conflict (Blocking simulated by immediate abort)

@@ -37,26 +37,23 @@ func (s *Server) hlcNow() uint64 {
 }
 
 // TxStart initializes a new transaction on this shard.
-// Creates the transaction buffer for subsequent operations.
+// Returns the local start time for lazy buffer creation.
 func (s *Server) TxStart(ctx context.Context, req *pb.TxStartRequest) (*pb.TxStartResponse, error) {
-	err := s.shard.TxStart(req.TxId, req.IsolationLevel, req.SnapshotTime)
+	startTime, err := s.shard.TxStart(req.TxId, req.IsolationLevel, req.SnapshotTime)
 	if err != nil {
-		if errors.Is(err, component.ErrTxAlreadyExists) {
-			return nil, status.Error(codes.AlreadyExists, err.Error())
+		if errors.Is(err, component.ErrUnsupportedIsolationLevel) {
+			return nil, status.Error(codes.InvalidArgument, err.Error())
 		}
 		return nil, s.convertError(err)
 	}
-	return &pb.TxStartResponse{}, nil
+	return &pb.TxStartResponse{StartTime: startTime}, nil
 }
 
 // TxRead reads a value within a transaction context.
-// External reads are recorded in the buffer for SER isolation level validation.
+// TxBuffer is lazily created if not exists.
 func (s *Server) TxRead(ctx context.Context, req *pb.TxReadRequest) (*pb.TxReadResponse, error) {
-	value, version, found, err := s.shard.TxRead(req.TxId, req.Key)
+	value, version, found, err := s.shard.TxRead(req.TxId, req.Key, req.SnapshotTime, req.IsolationLevel)
 	if err != nil {
-		if errors.Is(err, component.ErrTxNotFound) {
-			return nil, status.Error(codes.NotFound, "transaction not found, call TxStart first")
-		}
 		return nil, s.convertError(err)
 	}
 
@@ -68,13 +65,11 @@ func (s *Server) TxRead(ctx context.Context, req *pb.TxReadRequest) (*pb.TxReadR
 }
 
 // TxWrite buffers a write operation for a transaction.
+// TxBuffer is lazily created if not exists.
 // Returns the original version of the key before this write.
 func (s *Server) TxWrite(ctx context.Context, req *pb.TxWriteRequest) (*pb.TxWriteResponse, error) {
-	originalVersion, err := s.shard.TxWrite(req.TxId, req.Key, req.Value)
+	originalVersion, err := s.shard.TxWrite(req.TxId, req.Key, req.Value, req.SnapshotTime, req.IsolationLevel)
 	if err != nil {
-		if errors.Is(err, component.ErrTxNotFound) {
-			return nil, status.Error(codes.NotFound, "transaction not found, call TxStart first")
-		}
 		return nil, s.convertError(err)
 	}
 
@@ -82,13 +77,11 @@ func (s *Server) TxWrite(ctx context.Context, req *pb.TxWriteRequest) (*pb.TxWri
 }
 
 // TxDelete buffers a delete operation for a transaction.
+// TxBuffer is lazily created if not exists.
 // Returns the original version of the key before this delete.
 func (s *Server) TxDelete(ctx context.Context, req *pb.TxDeleteRequest) (*pb.TxDeleteResponse, error) {
-	originalVersion, err := s.shard.TxDelete(req.TxId, req.Key)
+	originalVersion, err := s.shard.TxDelete(req.TxId, req.Key, req.SnapshotTime, req.IsolationLevel)
 	if err != nil {
-		if errors.Is(err, component.ErrTxNotFound) {
-			return nil, status.Error(codes.NotFound, "transaction not found, call TxStart first")
-		}
 		return nil, s.convertError(err)
 	}
 	return &pb.TxDeleteResponse{OriginalVersion: originalVersion}, nil
@@ -116,8 +109,9 @@ func (s *Server) Prepare(ctx context.Context, req *pb.PrepareRequest) (*pb.Prepa
 }
 
 // Commit handles the 2PC commit phase.
+// Returns the local commit time on this shard.
 func (s *Server) Commit(ctx context.Context, req *pb.CommitRequest) (*pb.CommitResponse, error) {
-	err := s.shard.Commit(req.TxId, req.CommitTime)
+	commitTime, err := s.shard.Commit(req.TxId, req.CommitTime)
 	if err != nil {
 		if errors.Is(err, component.ErrTxNotFound) {
 			return nil, status.Error(codes.NotFound, "transaction not found")
@@ -125,7 +119,7 @@ func (s *Server) Commit(ctx context.Context, req *pb.CommitRequest) (*pb.CommitR
 		return nil, s.convertError(err)
 	}
 
-	return &pb.CommitResponse{}, nil
+	return &pb.CommitResponse{CommitTime: commitTime}, nil
 }
 
 // Abort handles the 2PC abort phase.
@@ -151,6 +145,16 @@ func (s *Server) QuickCommit(ctx context.Context, req *pb.QuickCommitRequest) (*
 		return nil, s.convertError(err)
 	}
 	return &pb.QuickCommitResponse{CommitTime: commitTime}, nil
+}
+
+// QuickAbort handles abort for single-shard transactions without 2PC.
+// This is a simplified version for the fast path.
+func (s *Server) QuickAbort(ctx context.Context, req *pb.QuickAbortRequest) (*pb.QuickAbortResponse, error) {
+	err := s.shard.QuickAbort(req.TxId)
+	if err != nil {
+		return nil, s.convertError(err)
+	}
+	return &pb.QuickAbortResponse{}, nil
 }
 
 // GetCurrentTime returns the current HLC timestamp of the shard.
