@@ -47,9 +47,9 @@ func (c *Client) Close() error {
 	return c.conn.Close()
 }
 
-// BeginTransaction starts a new transaction
-func (c *Client) BeginTransaction(ctx context.Context, isolation shardpb.IsolationLevel) (string, error) {
-	resp, err := c.client.BeginTransaction(ctx, &mulberrypb.BeginTransactionRequest{
+// StartTransaction starts a new transaction
+func (c *Client) StartTransaction(ctx context.Context, isolation shardpb.IsolationLevel) (string, error) {
+	resp, err := c.client.StartTransaction(ctx, &mulberrypb.StartTransactionRequest{
 		IsolationLevel: isolation,
 	})
 	if err != nil {

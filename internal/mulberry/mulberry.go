@@ -40,9 +40,9 @@ func NewRouter(topology *csrs.TopologyManager) *Router {
 	}
 }
 
-// BeginTransaction starts a new distributed transaction.
+// StartTransaction starts a new distributed transaction.
 // It generates a new TxID by calling the CSRS version increment.
-func (r *Router) BeginTransaction(ctx context.Context, isolationLevel pb.IsolationLevel) (string, error) {
+func (r *Router) StartTransaction(ctx context.Context, isolationLevel pb.IsolationLevel) (string, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -247,14 +247,14 @@ func (r *Router) Commit(ctx context.Context, txID string) error {
 			}
 		default:
 			_, err := stub.Commit(ctx, &pb.CommitRequest{
-				TxId:       txID,
+				TxId: txID,
 			})
 			if err != nil {
 				// Log error but continue - commit decision is final
 				continue
 			}
 		}
-		
+
 		if err != nil {
 			// Log error but continue - commit decision is final
 			continue

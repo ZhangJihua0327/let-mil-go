@@ -104,8 +104,7 @@ func (s *Shard) TxStart(txId string, isoLevel pb.IsolationLevel, snapshotTime ui
 	}
 
 	// Create buffer for this transaction with snapshot time and isolation level
-	startTime := s.clock.Now()
-	s.bufferMgr.Start(txId, ts, isoLevel, startTime)
+	s.bufferMgr.Start(txId, ts, isoLevel, s.clock.Now())
 	return nil
 }
 
@@ -117,7 +116,7 @@ func (s *Shard) TxRead(txId, key string) (string, uint64, bool, error) {
 		return "", 0, false, ErrTxNotFound
 	}
 
-	// Check write buffer first (read-your-writes)
+	// Check write buffer first (internal read)
 	if op, found := buf.GetWrite(key); found {
 		if op.Deleted {
 			return "", 0, false, nil
@@ -130,16 +129,17 @@ func (s *Shard) TxRead(txId, key string) (string, uint64, bool, error) {
 	snapshotTime := buf.SnapshotTime()
 	value, version, _, err := s.store.Get(key, snapshotTime)
 	if err != nil {
-		if errors.Is(err, ErrKeyNotFound) || errors.Is(err, ErrVersionNotFound) {
+		if buf.IsoLevel() == pb.IsolationLevel_ISOLATION_SER {
 			// Record external read even if not found (for SER validation)
 			buf.RecordRead(key, 0, false)
-			return "", 0, false, nil
 		}
 		return "", 0, false, err
 	}
 
 	// Record external read for SER isolation level validation
-	buf.RecordRead(key, version, true)
+	if buf.IsoLevel() == pb.IsolationLevel_ISOLATION_SER {
+		buf.RecordRead(key, version, true)
+	}
 	s.oplog.Append(&OpEntry{
 		Timestamp: s.HlcTick(),
 		TxId:      txId,
@@ -158,14 +158,19 @@ func (s *Shard) TxWrite(txId, key, value string) (uint64, error) {
 		return 0, ErrTxNotFound
 	}
 
-	// Get original version of the key
-	var originalVersion uint64 = 0
-	_, version, _, err := s.store.GetLatest(key)
-	if err == nil {
-		originalVersion = version
+	var version uint64 = 0
+	var err error = nil
+	switch buf.IsoLevel() {
+	case pb.IsolationLevel_ISOLATION_SI, pb.IsolationLevel_ISOLATION_SER:
+		_, version, _, err = s.store.Get(key, buf.SnapshotTime())
+	default:
+		_, version, _, err = s.store.GetLatest(key)
+	}
+	if err != nil {
+		version = 0
 	}
 
-	buf.PutWrite(key, value, originalVersion)
+	buf.PutWrite(key, value, version)
 	s.oplog.Append(&OpEntry{
 		Timestamp: s.HlcTick(),
 		TxId:      txId,
@@ -174,7 +179,7 @@ func (s *Shard) TxWrite(txId, key, value string) (uint64, error) {
 		OpType:    OpTypeWrite,
 	})
 
-	return originalVersion, nil
+	return version, nil
 }
 
 // TxDelete buffers a delete operation.
@@ -184,13 +189,19 @@ func (s *Shard) TxDelete(txId, key string) (uint64, error) {
 		return 0, ErrTxNotFound
 	}
 
-	var originalVersion uint64 = 0
-	_, version, _, err := s.store.GetLatest(key)
-	if err == nil {
-		originalVersion = version
+	var version uint64 = 0
+	var err error = nil
+	switch buf.IsoLevel() {
+	case pb.IsolationLevel_ISOLATION_SI, pb.IsolationLevel_ISOLATION_SER:
+		_, version, _, err = s.store.Get(key, buf.SnapshotTime())
+	default:
+		_, version, _, err = s.store.GetLatest(key)
+	}
+	if err != nil {
+		version = 0
 	}
 
-	buf.PutDelete(key, originalVersion)
+	buf.PutDelete(key, version)
 	s.oplog.Append(&OpEntry{
 		Timestamp: s.HlcTick(),
 		TxId:      txId,
@@ -198,7 +209,7 @@ func (s *Shard) TxDelete(txId, key string) (uint64, error) {
 		Value:     "",
 		OpType:    OpTypeDelete,
 	})
-	return originalVersion, nil
+	return version, nil
 }
 
 // Prepare handles the 2PC prepare phase.

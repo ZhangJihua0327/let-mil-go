@@ -17,12 +17,12 @@ func NewServer(router *Router) *Server {
 	return &Server{router: router}
 }
 
-func (s *Server) BeginTransaction(ctx context.Context, req *mulberrypb.BeginTransactionRequest) (*mulberrypb.BeginTransactionResponse, error) {
-	txID, err := s.router.BeginTransaction(ctx, req.IsolationLevel)
+func (s *Server) StartTransaction(ctx context.Context, req *mulberrypb.StartTransactionRequest) (*mulberrypb.StartTransactionResponse, error) {
+	txID, err := s.router.StartTransaction(ctx, req.IsolationLevel)
 	if err != nil {
 		return nil, err
 	}
-	return &mulberrypb.BeginTransactionResponse{TxId: txID}, nil
+	return &mulberrypb.StartTransactionResponse{TxId: txID}, nil
 }
 
 func (s *Server) Read(ctx context.Context, req *mulberrypb.ReadRequest) (*mulberrypb.ReadResponse, error) {

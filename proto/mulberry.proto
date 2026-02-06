@@ -7,7 +7,7 @@ option go_package = "github.com/let-mil-go/proto/mulberrypb";
 import "proto/shard.proto";
 
 service MulberryService {
-  rpc BeginTransaction(BeginTransactionRequest) returns (BeginTransactionResponse);
+  rpc StartTransaction(StartTransactionRequest) returns (StartTransactionResponse);
   rpc Read(ReadRequest) returns (ReadResponse);
   rpc Write(WriteRequest) returns (WriteResponse);
   rpc Delete(DeleteRequest) returns (DeleteResponse);
@@ -15,11 +15,11 @@ service MulberryService {
   rpc Abort(AbortRequest) returns (AbortResponse);
 }
 
-message BeginTransactionRequest {
+message StartTransactionRequest {
   shard.IsolationLevel isolation_level = 1;
 }
 
-message BeginTransactionResponse {
+message StartTransactionResponse {
   string tx_id = 1;
 }
 

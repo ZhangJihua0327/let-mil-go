@@ -15,8 +15,8 @@ import (
 
 func main() {
 	addr := flag.String("addr", "localhost:50051", "Mulberry server address (comma separated for multiple)")
-	cmd := flag.String("cmd", "", "Command to execute (non-interactive): begin, read, write, delete, commit, abort")
-	txIDFlag := flag.String("tx", "", "Transaction ID (required for non-interactive mode except begin)")
+	cmd := flag.String("cmd", "", "Command to execute (non-interactive): start, read, write, delete, commit, abort")
+	txIDFlag := flag.String("tx", "", "Transaction ID (required for non-interactive mode except start)")
 	keyFlag := flag.String("key", "", "Key for read/write/delete")
 	valFlag := flag.String("val", "", "Value for write")
 
@@ -66,8 +66,8 @@ func runInteractive(c *client.Client) {
 		case "q", "quit", "exit":
 			cancel()
 			return
-		case "start", "begin":
-			tid, err := c.BeginTransaction(ctx, shardpb.IsolationLevel_ISOLATION_SI)
+		case "start":
+			tid, err := c.StartTransaction(ctx, shardpb.IsolationLevel_ISOLATION_SI)
 			if err != nil {
 				fmt.Printf("Error: %v\n", err)
 			} else {
@@ -168,9 +168,9 @@ func runOneShot(c *client.Client, cmd, txID, key, val string) {
 	defer cancel()
 
 	switch cmd {
-	case "begin":
+	case "start":
 		// Default to Snapshot Isolation for now
-		tid, err := c.BeginTransaction(ctx, shardpb.IsolationLevel_ISOLATION_SI)
+		tid, err := c.StartTransaction(ctx, shardpb.IsolationLevel_ISOLATION_SI)
 		if err != nil {
 			die(err)
 		}
