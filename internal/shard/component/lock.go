@@ -35,9 +35,10 @@ func (m LockMode) String() string {
 
 // lockEntry represents the lock state for a single key.
 type lockEntry struct {
-	mode    LockMode
-	holders map[string]struct{} // txIds holding the lock
-	waiters []string            // txIds waiting for the lock
+	mode        LockMode
+	holders     map[string]struct{} // txIds holding the lock
+	waiters     []string            // txIds waiting for the lock
+	prepareTime uint64              // HLC timestamp when write lock was acquired (for 2PC)
 }
 
 // LockManager manages key-level locks for transactions.
@@ -85,6 +86,12 @@ func (m *LockManager) AcquireRead(txId, key string) error {
 
 // AcquireWrite attempts to acquire a write lock on a key.
 func (m *LockManager) AcquireWrite(txId, key string) error {
+	return m.AcquireWriteWithPrepareTime(txId, key, 0)
+}
+
+// AcquireWriteWithPrepareTime attempts to acquire a write lock on a key with a prepare time.
+// The prepareTime is used for 2PC to allow snapshot reads to skip pending writes.
+func (m *LockManager) AcquireWriteWithPrepareTime(txId, key string, prepareTime uint64) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -99,6 +106,7 @@ func (m *LockManager) AcquireWrite(txId, key string) error {
 	if entry.mode == LockNone {
 		entry.mode = LockWrite
 		entry.holders[txId] = struct{}{}
+		entry.prepareTime = prepareTime
 		m.recordTxLock(txId, key, LockWrite)
 		return nil
 	}
@@ -108,6 +116,7 @@ func (m *LockManager) AcquireWrite(txId, key string) error {
 		if len(entry.holders) == 1 {
 			if _, ok := entry.holders[txId]; ok {
 				entry.mode = LockWrite
+				entry.prepareTime = prepareTime
 				m.recordTxLock(txId, key, LockWrite)
 				return nil
 			}
@@ -207,6 +216,31 @@ func (m *LockManager) IsLocked(key string) bool {
 		return false
 	}
 	return entry.mode != LockNone
+}
+
+// GetWriteLockPrepareTime returns the prepare time of the write lock on a key.
+// Returns 0 if the key is not write-locked.
+func (m *LockManager) GetWriteLockPrepareTime(key string) uint64 {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	entry, ok := m.locks[key]
+	if !ok || entry.mode != LockWrite {
+		return 0
+	}
+	return entry.prepareTime
+}
+
+// IsWriteLocked checks if a key has a write lock.
+func (m *LockManager) IsWriteLocked(key string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	entry, ok := m.locks[key]
+	if !ok {
+		return false
+	}
+	return entry.mode == LockWrite
 }
 
 func (m *LockManager) getOrCreateEntry(key string) *lockEntry {

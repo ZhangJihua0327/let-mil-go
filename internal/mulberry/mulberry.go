@@ -170,15 +170,62 @@ func (r *Router) Delete(ctx context.Context, txID string, key string) error {
 	return nil
 }
 
-// Commit commits the transaction using 2PC protocol.
-// Phase 1: Prepare all shards. On first VOTE_ABORT, abort all and return immediately.
-// Phase 2: Only commit shards that voted VOTE_COMMIT. Skip VOTE_EMPTY shards.
+// Commit commits the transaction.
+// For single-shard transactions, uses QuickCommit for better performance.
+// For multi-shard transactions, uses 2PC protocol.
 func (r *Router) Commit(ctx context.Context, txID string) error {
 	txCtx, err := r.getTxContext(txID)
 	if err != nil {
 		return err
 	}
 
+	// Single-shard optimization: use QuickCommit
+	if len(txCtx.InvolvedShards) == 1 {
+		return r.quickCommit(ctx, txID, txCtx)
+	}
+
+	// Multi-shard: use 2PC
+	return r.twoPhaseCommit(ctx, txID, txCtx)
+}
+
+// quickCommit handles single-shard transactions without 2PC overhead.
+func (r *Router) quickCommit(ctx context.Context, txID string, txCtx *TxContext) error {
+	// Get the only shard
+	var shardID string
+	for sid := range txCtx.InvolvedShards {
+		shardID = sid
+		break
+	}
+
+	info := r.topology.GetShardInfo(shardID)
+	if info == nil {
+		r.removeTxContext(txID)
+		return fmt.Errorf("shard %s not found during commit", shardID)
+	}
+
+	stub, err := r.connMgr.GetStub(info.Address)
+	if err != nil {
+		r.removeTxContext(txID)
+		return fmt.Errorf("failed to get stub for QuickCommit: %w", err)
+	}
+
+	_, err = stub.QuickCommit(ctx, &pb.QuickCommitRequest{
+		TxId:           txID,
+		IsolationLevel: txCtx.IsolationLevel,
+	})
+	if err != nil {
+		r.removeTxContext(txID)
+		return fmt.Errorf("QuickCommit failed on shard %s: %w", shardID, err)
+	}
+
+	r.removeTxContext(txID)
+	return nil
+}
+
+// twoPhaseCommit handles multi-shard transactions using 2PC protocol.
+// Phase 1: Prepare all shards. On first VOTE_ABORT, abort all and return immediately.
+// Phase 2: Only commit shards that voted VOTE_COMMIT. Skip VOTE_EMPTY shards.
+func (r *Router) twoPhaseCommit(ctx context.Context, txID string, txCtx *TxContext) error {
 	// Phase 1: Prepare
 	// Track shards that need commit (voted VOTE_COMMIT)
 	commitShards := make(map[string]uint64) // shardID -> prepareTime
@@ -260,11 +307,6 @@ func (r *Router) Commit(ctx context.Context, txID string) error {
 				// Log error but continue - commit decision is final
 				continue
 			}
-		}
-
-		if err != nil {
-			// Log error but continue - commit decision is final
-			continue
 		}
 	}
 

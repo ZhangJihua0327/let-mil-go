@@ -45,8 +45,9 @@ func (s *Shard) ID() string {
 }
 
 // Put stores a key-value pair with a specific version and transaction ID.
-func (s *Shard) Put(key, value string, version uint64, txId string) error {
-	return s.store.Put(key, value, version, txId)
+// pending indicates if this is a pending write (2PC prepare phase).
+func (s *Shard) Put(key, value string, version uint64, txId string, pending bool, prepareTime uint64) error {
+	return s.store.Put(key, value, version, txId, pending, prepareTime)
 }
 
 // Get retrieves the value for a key at the specified version.
@@ -62,8 +63,9 @@ func (s *Shard) GetLatest(key string) (string, uint64, string, error) {
 }
 
 // Delete marks a key as deleted at a specific version with transaction ID.
-func (s *Shard) Delete(key string, version uint64, txId string) error {
-	return s.store.Delete(key, version, txId)
+// pending indicates if this is a pending delete (2PC prepare phase).
+func (s *Shard) Delete(key string, version uint64, txId string, pending bool, prepareTime uint64) error {
+	return s.store.Delete(key, version, txId, pending, prepareTime)
 }
 
 // GC performs garbage collection on versions older than minVersion.
@@ -110,6 +112,9 @@ func (s *Shard) TxStart(txId string, isoLevel pb.IsolationLevel, snapshotTime ui
 
 // TxRead reads a value within a transaction context.
 // Uses the snapshot timestamp stored in the transaction buffer.
+// If there's a pending write with prepareTime > snapshotTime, the read can skip
+// the pending version and read older committed data (optimized for old snapshot reads).
+// If snapshotTime >= prepareTime of a pending version, the read will be blocked (returns error).
 func (s *Shard) TxRead(txId, key string) (string, uint64, bool, error) {
 	buf, ok := s.bufferMgr.Get(txId)
 	if !ok {
@@ -125,10 +130,17 @@ func (s *Shard) TxRead(txId, key string) (string, uint64, bool, error) {
 		return op.Value, op.OriginalVersion, true, nil
 	}
 
-	// Read from store at snapshot time (external read)
+	// Read from store at snapshot time
+	// Handles pending versions:
+	// - If snapshotTime < prepareTime: skip pending, read older version
+	// - If snapshotTime >= prepareTime: return ErrPendingRead (caller should retry/wait)
 	snapshotTime := buf.SnapshotTime()
 	value, version, _, err := s.store.Get(key, snapshotTime)
 	if err != nil {
+		if err == ErrPendingRead {
+			// The read is blocked by a pending write, caller should retry
+			return "", 0, false, err
+		}
 		if buf.IsoLevel() == pb.IsolationLevel_ISOLATION_SER {
 			// Record external read even if not found (for SER validation)
 			buf.RecordRead(key, 0, false)
@@ -213,6 +225,8 @@ func (s *Shard) TxDelete(txId, key string) (uint64, error) {
 }
 
 // Prepare handles the 2PC prepare phase.
+// After acquiring locks and validation, it pre-writes pending data to the MVCC store.
+// The pending data will be confirmed on commit or removed on abort.
 func (s *Shard) Prepare(txId string, isoLevel pb.IsolationLevel) (pb.Vote, uint64, error) {
 	buf, ok := s.bufferMgr.Get(txId)
 	if !ok {
@@ -238,12 +252,144 @@ func (s *Shard) Prepare(txId string, isoLevel pb.IsolationLevel) (pb.Vote, uint6
 
 	s.txStatusTbl.Start(txId)
 
+	// Generate prepareTime first for use in locks and pending writes
+	prepareTime := s.HlcTick()
+
 	abortAndCleanup := func() (pb.Vote, uint64, error) {
 		s.abortCleanup(txId)
 		return pb.Vote_VOTE_ABORT, 0, nil
 	}
 
-	// Acquire write locks
+	// Acquire write locks with prepareTime
+	for _, key := range buf.WriteKeys() {
+		if err := s.lockMgr.AcquireWriteWithPrepareTime(txId, key, prepareTime); err != nil {
+			return abortAndCleanup()
+		}
+	}
+
+	// CAS Validation for writes (SI and SER)
+	if isoLevel == pb.IsolationLevel_ISOLATION_SI || isoLevel == pb.IsolationLevel_ISOLATION_SER {
+		for _, op := range buf.WriteOps() {
+			_, currentVersion, _, err := s.store.GetLatest(op.Key)
+			if err != nil {
+				if op.OriginalVersion != 0 {
+					return abortAndCleanup()
+				}
+			} else {
+				if currentVersion != op.OriginalVersion {
+					return abortAndCleanup()
+				}
+			}
+		}
+	}
+
+	// CAS Validation for reads (SER only)
+	if isoLevel == pb.IsolationLevel_ISOLATION_SER {
+		for _, r := range buf.ReadRecords() {
+			_, currentVersion, _, err := s.store.GetLatest(r.Key)
+			if err != nil {
+				if r.Found {
+					return abortAndCleanup()
+				}
+			} else {
+				if !r.Found {
+					return abortAndCleanup()
+				}
+				if currentVersion != r.Version {
+					return abortAndCleanup()
+				}
+			}
+		}
+	}
+
+	// Pre-write pending data to MVCC store
+	// Use prepareTime as the temporary version (will be updated to commitTime on commit)
+	for _, op := range buf.WriteOps() {
+		if op.Deleted {
+			if err := s.store.Delete(op.Key, prepareTime, txId, true, prepareTime); err != nil {
+				return abortAndCleanup()
+			}
+		} else {
+			if err := s.store.Put(op.Key, op.Value, prepareTime, txId, true, prepareTime); err != nil {
+				return abortAndCleanup()
+			}
+		}
+	}
+
+	s.txStatusTbl.Prepare(txId, prepareTime)
+
+	return pb.Vote_VOTE_COMMIT, prepareTime, nil
+}
+
+// Commit handles the 2PC commit phase.
+// It confirms pending data in the MVCC store with the commit time and releases locks.
+func (s *Shard) Commit(txId string, commitTime uint64) error {
+
+	_, ok := s.bufferMgr.Get(txId)
+	if !ok {
+		return ErrTxNotFound
+	}
+	if commitTime == 0 {
+		commitTime = s.HlcTick()
+	} else {
+		commitTime = s.HlcUpdate(commitTime)
+	}
+
+	// Confirm pending writes with the commit time
+	s.store.ConfirmPending(txId, commitTime)
+
+	s.clock.Update(commitTime)
+	s.cleanup(txId)
+	s.txStatusTbl.Commit(txId)
+	s.oplog.Append(&OpEntry{
+		Timestamp: commitTime,
+		TxId:      txId,
+		Key:       "",
+		Value:     "",
+		OpType:    OpTypeCommit,
+	})
+
+	return nil
+}
+
+// QuickCommit handles single-shard transactions without 2PC overhead.
+// It performs validation, writes data directly to the MVCC store (not pending),
+// and commits in a single atomic operation.
+// Returns the commit time on success, or an error if validation fails.
+func (s *Shard) QuickCommit(txId string, isoLevel pb.IsolationLevel) (uint64, error) {
+	buf, ok := s.bufferMgr.Get(txId)
+	if !ok {
+		return 0, ErrTxNotFound
+	}
+
+	hasWrites := len(buf.WriteOps()) > 0
+	hasReads := len(buf.ReadRecords()) > 0
+
+	// No operations at all
+	if !hasWrites && !hasReads {
+		s.cleanup(txId)
+		return 0, nil
+	}
+
+	// No writes and reads don't need CAS validation (not SER)
+	needsReadValidation := isoLevel == pb.IsolationLevel_ISOLATION_SER
+	if !hasWrites && !needsReadValidation {
+		s.cleanup(txId)
+		return 0, nil
+	}
+
+	s.txStatusTbl.Start(txId)
+
+	// Generate commit time
+	commitTime := s.HlcTick()
+
+	abortAndCleanup := func() (uint64, error) {
+		s.cleanup(txId)
+		s.txStatusTbl.Abort(txId)
+		return 0, ErrVersionConflict
+	}
+
+	// Acquire write locks (no need for prepareTime since we commit immediately)
 	for _, key := range buf.WriteKeys() {
 		if err := s.lockMgr.AcquireWrite(txId, key); err != nil {
 			return abortAndCleanup()
@@ -285,34 +431,20 @@ func (s *Shard) Prepare(txId string, isoLevel pb.IsolationLevel) (pb.Vote, uint6
 		}
 	}
 
-	prepareTime := s.HlcTick()
-	s.txStatusTbl.Prepare(txId, prepareTime)
-
-	return pb.Vote_VOTE_COMMIT, prepareTime, nil
-}
-
-// Commit handles the 2PC commit phase.
-func (s *Shard) Commit(txId string, commitTime uint64) error {
-
-	buf, ok := s.bufferMgr.Get(txId)
-	if !ok {
-		return ErrTxNotFound
-	}
-	if commitTime == 0 {
-		commitTime = s.HlcTick()
-	} else {
-		commitTime = s.HlcUpdate(commitTime)
-	}
-
+	// Write data directly to MVCC store (not pending)
 	for _, op := range buf.WriteOps() {
 		if op.Deleted {
-			s.store.Delete(op.Key, commitTime, txId)
+			if err := s.store.Delete(op.Key, commitTime, txId, false, 0); err != nil {
+				return abortAndCleanup()
+			}
 		} else {
-			s.store.Put(op.Key, op.Value, commitTime, txId)
+			if err := s.store.Put(op.Key, op.Value, commitTime, txId, false, 0); err != nil {
+				return abortAndCleanup()
+			}
 		}
 	}
 
-	s.clock.Update(commitTime)
+	// Cleanup and commit
 	s.cleanup(txId)
 	s.txStatusTbl.Commit(txId)
 	s.oplog.Append(&OpEntry{
@@ -323,7 +455,7 @@ func (s *Shard) Commit(txId string, commitTime uint64) error {
 		OpType:    OpTypeCommit,
 	})
 
-	return nil
+	return commitTime, nil
 }
 
 // Abort handles the 2PC abort phase.
@@ -335,6 +467,8 @@ func (s *Shard) Abort(txId string) error {
 }
 
 func (s *Shard) abortCleanup(txId string) {
+	// Remove pending writes from MVCC store before releasing locks
+	s.store.RemovePending(txId)
 	s.cleanup(txId)
 	s.txStatusTbl.Abort(txId)
 	s.oplog.Append(&OpEntry{

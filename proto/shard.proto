@@ -30,6 +30,9 @@ service ShardService {
   rpc Commit(CommitRequest) returns (CommitResponse);
   rpc Abort(AbortRequest) returns (AbortResponse);
 
+  // Single-shard fast commit (no 2PC)
+  rpc QuickCommit(QuickCommitRequest) returns (QuickCommitResponse);
+
   // Shard metadata
   rpc GetCurrentTime(GetCurrentTimeRequest) returns (GetCurrentTimeResponse);
 }
@@ -124,6 +127,16 @@ message AbortRequest {
 }
 
 message AbortResponse {}
+
+// Single-shard QuickCommit (no 2PC)
+message QuickCommitRequest {
+  string tx_id = 1;
+  IsolationLevel isolation_level = 2;
+}
+
+message QuickCommitResponse {
+  uint64 commit_time = 1;  // Commit HLC timestamp
+}
 
 // Shard current time
 message GetCurrentTimeRequest {}

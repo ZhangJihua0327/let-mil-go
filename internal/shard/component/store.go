@@ -9,14 +9,17 @@ var (
 	ErrKeyNotFound     = errors.New("key not found")
 	ErrVersionNotFound = errors.New("version not found")
 	ErrVersionConflict = errors.New("version conflict")
+	ErrPendingRead     = errors.New("pending read blocked")
 )
 
 // VersionedValue represents a value with its version metadata.
 type VersionedValue struct {
-	Value   string
-	Version uint64
-	Deleted bool
-	TxId    string // Transaction ID that created this version
+	Value       string
+	Version     uint64
+	Deleted     bool
+	TxId        string // Transaction ID that created this version
+	Pending     bool   // True if this version is pending (2PC not yet committed)
+	PrepareTime uint64 // HLC timestamp when this version was prepared (0 if committed)
 }
 
 // MVCCStore is a multi-version concurrency control store.
@@ -34,8 +37,9 @@ func NewMVCCStore() *MVCCStore {
 }
 
 // Put inserts or updates a key-value pair at the specified version.
+// If pending is true, the value is marked as pending (2PC prepare phase).
 // If the version already exists, returns ErrVersionConflict.
-func (s *MVCCStore) Put(key, value string, version uint64, txId string) error {
+func (s *MVCCStore) Put(key, value string, version uint64, txId string, pending bool, prepareTime uint64) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -47,10 +51,12 @@ func (s *MVCCStore) Put(key, value string, version uint64, txId string) error {
 	}
 
 	vv := VersionedValue{
-		Value:   value,
-		Version: version,
-		Deleted: false,
-		TxId:    txId,
+		Value:       value,
+		Version:     version,
+		Deleted:     false,
+		TxId:        txId,
+		Pending:     pending,
+		PrepareTime: prepareTime,
 	}
 
 	// Insert at correct position to maintain sorted order
@@ -62,9 +68,13 @@ func (s *MVCCStore) Put(key, value string, version uint64, txId string) error {
 	return nil
 }
 
-// Get retrieves the value for a key at the specified version.
-// Returns the latest version <= requested version, along with version and txId.
-func (s *MVCCStore) Get(key string, version uint64) (string, uint64, string, error) {
+// Get retrieves the value for a key at the specified snapshot time.
+// This method handles pending versions:
+//   - If snapshotTime < prepareTime of pending version: skip pending, read older version
+//   - If snapshotTime >= prepareTime of pending version: return ErrPendingRead (caller should block/retry)
+//
+// Returns value, version, txId, and error.
+func (s *MVCCStore) Get(key string, snapshotTime uint64) (string, uint64, string, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
@@ -73,18 +83,33 @@ func (s *MVCCStore) Get(key string, version uint64) (string, uint64, string, err
 		return "", 0, "", ErrKeyNotFound
 	}
 
-	// Find the latest version <= requested version
-	idx := s.findVersionIndex(versions, version+1) - 1
-	if idx < 0 {
-		return "", 0, "", ErrVersionNotFound
+	// Find the latest version <= snapshotTime, skipping pending versions appropriately
+	for i := len(versions) - 1; i >= 0; i-- {
+		vv := versions[i]
+
+		// Skip versions newer than snapshotTime
+		if vv.Version > snapshotTime {
+			continue
+		}
+
+		// Check if this is a pending version
+		if vv.Pending {
+			// If snapshotTime >= prepareTime, reader should be blocked waiting for commit/abort
+			if snapshotTime >= vv.PrepareTime {
+				return "", 0, "", ErrPendingRead
+			}
+			// If snapshotTime < prepareTime, skip this pending version and look for older ones
+			continue
+		}
+
+		// Found a committed version <= snapshotTime
+		if vv.Deleted {
+			return "", 0, "", ErrKeyNotFound
+		}
+		return vv.Value, vv.Version, vv.TxId, nil
 	}
 
-	vv := versions[idx]
-	if vv.Deleted {
-		return "", 0, "", ErrKeyNotFound
-	}
-
-	return vv.Value, vv.Version, vv.TxId, nil
+	return "", 0, "", ErrVersionNotFound
 }
 
 // GetExact retrieves the value for a key at exactly the specified version.
@@ -110,7 +135,8 @@ func (s *MVCCStore) GetExact(key string, version uint64) (string, string, error)
 }
 
 // Delete marks a key as deleted at the specified version.
-func (s *MVCCStore) Delete(key string, version uint64, txId string) error {
+// If pending is true, the deletion is marked as pending (2PC prepare phase).
+func (s *MVCCStore) Delete(key string, version uint64, txId string, pending bool, prepareTime uint64) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -122,10 +148,12 @@ func (s *MVCCStore) Delete(key string, version uint64, txId string) error {
 	}
 
 	vv := VersionedValue{
-		Value:   "",
-		Version: version,
-		Deleted: true,
-		TxId:    txId,
+		Value:       "",
+		Version:     version,
+		Deleted:     true,
+		TxId:        txId,
+		Pending:     pending,
+		PrepareTime: prepareTime,
 	}
 
 	versions = append(versions, VersionedValue{})
@@ -200,4 +228,60 @@ func (s *MVCCStore) findVersionIndex(versions []VersionedValue, version uint64) 
 		}
 	}
 	return left
+}
+
+// ConfirmPending confirms pending versions for a transaction, marking them as committed.
+// Updates the version to the commit time.
+func (s *MVCCStore) ConfirmPending(txId string, commitTime uint64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	for key, versions := range s.data {
+		modified := false
+		for i := range versions {
+			if versions[i].TxId == txId && versions[i].Pending {
+				// Remove old pending entry and create new committed entry
+				oldVersion := versions[i]
+				// Remove this entry
+				versions = append(versions[:i], versions[i+1:]...)
+				modified = true
+
+				// Insert at correct position with commitTime
+				idx := s.findVersionIndex(versions, commitTime)
+				vv := VersionedValue{
+					Value:       oldVersion.Value,
+					Version:     commitTime,
+					Deleted:     oldVersion.Deleted,
+					TxId:        txId,
+					Pending:     false,
+					PrepareTime: 0,
+				}
+				versions = append(versions, VersionedValue{})
+				copy(versions[idx+1:], versions[idx:])
+				versions[idx] = vv
+				break // One pending entry per tx per key
+			}
+		}
+		if modified {
+			s.data[key] = versions
+		}
+	}
+}
+
+// RemovePending removes all pending versions for a transaction (used on abort).
+func (s *MVCCStore) RemovePending(txId string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	for key, versions := range s.data {
+		filtered := versions[:0]
+		for _, v := range versions {
+			if !(v.TxId == txId && v.Pending) {
+				filtered = append(filtered, v)
+			}
+		}
+		if len(filtered) != len(versions) {
+			s.data[key] = filtered
+		}
+	}
 }

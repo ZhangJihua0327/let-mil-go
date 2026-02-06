@@ -137,6 +137,22 @@ func (s *Server) Abort(ctx context.Context, req *pb.AbortRequest) (*pb.AbortResp
 	return &pb.AbortResponse{}, nil
 }
 
+// QuickCommit handles single-shard transactions without 2PC overhead.
+// It performs validation and commits in a single atomic operation.
+func (s *Server) QuickCommit(ctx context.Context, req *pb.QuickCommitRequest) (*pb.QuickCommitResponse, error) {
+	commitTime, err := s.shard.QuickCommit(req.TxId, req.IsolationLevel)
+	if err != nil {
+		if errors.Is(err, component.ErrTxNotFound) {
+			return nil, status.Error(codes.NotFound, "transaction not found")
+		}
+		if errors.Is(err, component.ErrVersionConflict) {
+			return nil, status.Error(codes.Aborted, "version conflict during validation")
+		}
+		return nil, s.convertError(err)
+	}
+	return &pb.QuickCommitResponse{CommitTime: commitTime}, nil
+}
+
 // GetCurrentTime returns the current HLC timestamp of the shard.
 func (s *Server) GetCurrentTime(ctx context.Context, req *pb.GetCurrentTimeRequest) (*pb.GetCurrentTimeResponse, error) {
 	return &pb.GetCurrentTimeResponse{Time: s.shard.HlcNow()}, nil
