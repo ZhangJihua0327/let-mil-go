@@ -44,30 +44,6 @@ func (s *Shard) ID() string {
 	return s.id
 }
 
-// Put stores a key-value pair with a specific version and transaction ID.
-// pending indicates if this is a pending write (2PC prepare phase).
-func (s *Shard) Put(key, value string, version uint64, txId string, pending bool, prepareTime uint64) error {
-	return s.store.Put(key, value, version, txId, pending, prepareTime)
-}
-
-// Get retrieves the value for a key at the specified version.
-// Returns value, version, txId, and error.
-func (s *Shard) Get(key string, version uint64) (string, uint64, string, error) {
-	return s.store.Get(key, version)
-}
-
-// GetLatest retrieves the latest value for a key.
-// Returns value, version, txId, and error.
-func (s *Shard) GetLatest(key string) (string, uint64, string, error) {
-	return s.store.GetLatest(key)
-}
-
-// Delete marks a key as deleted at a specific version with transaction ID.
-// pending indicates if this is a pending delete (2PC prepare phase).
-func (s *Shard) Delete(key string, version uint64, txId string, pending bool, prepareTime uint64) error {
-	return s.store.Delete(key, version, txId, pending, prepareTime)
-}
-
 // GC performs garbage collection on versions older than minVersion.
 func (s *Shard) GC(minVersion uint64) int {
 	return s.store.GC(minVersion)

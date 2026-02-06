@@ -2,9 +2,10 @@ package shard
 
 import (
 	"context"
+	"testing"
+
 	"github.com/let-mil-go/internal/shard/component"
 	pb "github.com/let-mil-go/proto/shardpb"
-	"testing"
 )
 
 func TestSingleTransactionSuccess(t *testing.T) {
@@ -55,14 +56,29 @@ func TestSingleTransactionSuccess(t *testing.T) {
 	}
 
 	// 4. Verify Data
-	// Read directly from shard or via new transaction
-	storedVal, _, _, err := s.shard.GetLatest(key)
+	// Read via new transaction
+	verifyTxId := "tx-verify"
+	_, err = s.TxStart(ctx, &pb.TxStartRequest{TxId: verifyTxId})
 	if err != nil {
-		t.Fatalf("GetLatest failed: %v", err)
+		t.Fatalf("Verify TxStart failed: %v", err)
 	}
-	if storedVal != value {
-		t.Errorf("Expected value %s, got %s", value, storedVal)
+
+	readResp, err := s.TxRead(ctx, &pb.TxReadRequest{
+		TxId: verifyTxId,
+		Key:  key,
+	})
+	if err != nil {
+		t.Fatalf("TxRead failed: %v", err)
 	}
+	if !readResp.Found {
+		t.Fatalf("Key not found after commit")
+	}
+	if readResp.Value != value {
+		t.Errorf("Expected value %s, got %s", value, readResp.Value)
+	}
+
+	// Cleanup verify transaction
+	_, _ = s.Abort(ctx, &pb.AbortRequest{TxId: verifyTxId})
 }
 
 func TestConcurrentTransactionsConflict(t *testing.T) {
