@@ -115,6 +115,7 @@ func (s *Shard) TxStart(txId string, isoLevel pb.IsolationLevel, snapshotTime ui
 // If there's a pending write with prepareTime > snapshotTime, the read can skip
 // the pending version and read older committed data (optimized for old snapshot reads).
 // If snapshotTime >= prepareTime of a pending version, the read will be blocked (returns error).
+// For SER isolation level, acquires read lock immediately to prevent conflicts.
 func (s *Shard) TxRead(txId, key string) (string, uint64, bool, error) {
 	buf, ok := s.bufferMgr.Get(txId)
 	if !ok {
@@ -130,6 +131,13 @@ func (s *Shard) TxRead(txId, key string) (string, uint64, bool, error) {
 		return op.Value, op.OriginalVersion, true, nil
 	}
 
+	// For SER isolation level, acquire read lock immediately (pessimistic locking)
+	if buf.IsoLevel() == pb.IsolationLevel_ISOLATION_SER {
+		if err := s.lockMgr.AcquireRead(txId, key); err != nil {
+			return "", 0, false, err
+		}
+	}
+
 	// Read from store at snapshot time
 	// Handles pending versions:
 	// - If snapshotTime < prepareTime: skip pending, read older version
@@ -142,13 +150,13 @@ func (s *Shard) TxRead(txId, key string) (string, uint64, bool, error) {
 			return "", 0, false, err
 		}
 		if buf.IsoLevel() == pb.IsolationLevel_ISOLATION_SER {
-			// Record external read even if not found (for SER validation)
+			// Record external read even if not found (for tracking purposes)
 			buf.RecordRead(key, 0, false)
 		}
 		return "", 0, false, err
 	}
 
-	// Record external read for SER isolation level validation
+	// Record external read for SER isolation level (for tracking, not for validation)
 	if buf.IsoLevel() == pb.IsolationLevel_ISOLATION_SER {
 		buf.RecordRead(key, version, true)
 	}
@@ -164,10 +172,18 @@ func (s *Shard) TxRead(txId, key string) (string, uint64, bool, error) {
 }
 
 // TxWrite buffers a write operation.
+// For SER isolation level, acquires write lock immediately to prevent conflicts.
 func (s *Shard) TxWrite(txId, key, value string) (uint64, error) {
 	buf, ok := s.bufferMgr.Get(txId)
 	if !ok {
 		return 0, ErrTxNotFound
+	}
+
+	// For SER isolation level, acquire write lock immediately (pessimistic locking)
+	if buf.IsoLevel() == pb.IsolationLevel_ISOLATION_SER {
+		if err := s.lockMgr.AcquireWrite(txId, key); err != nil {
+			return 0, err
+		}
 	}
 
 	var version uint64 = 0
@@ -195,10 +211,18 @@ func (s *Shard) TxWrite(txId, key, value string) (uint64, error) {
 }
 
 // TxDelete buffers a delete operation.
+// For SER isolation level, acquires write lock immediately to prevent conflicts.
 func (s *Shard) TxDelete(txId, key string) (uint64, error) {
 	buf, ok := s.bufferMgr.Get(txId)
 	if !ok {
 		return 0, ErrTxNotFound
+	}
+
+	// For SER isolation level, acquire write lock immediately (pessimistic locking)
+	if buf.IsoLevel() == pb.IsolationLevel_ISOLATION_SER {
+		if err := s.lockMgr.AcquireWrite(txId, key); err != nil {
+			return 0, err
+		}
 	}
 
 	var version uint64 = 0
@@ -227,7 +251,8 @@ func (s *Shard) TxDelete(txId, key string) (uint64, error) {
 // Prepare handles the 2PC prepare phase.
 // After acquiring locks and validation, it pre-writes pending data to the MVCC store.
 // The pending data will be confirmed on commit or removed on abort.
-func (s *Shard) Prepare(txId string, isoLevel pb.IsolationLevel) (pb.Vote, uint64, error) {
+// For SER isolation level, locks are already acquired during read/write operations.
+func (s *Shard) Prepare(txId string) (pb.Vote, uint64, error) {
 	buf, ok := s.bufferMgr.Get(txId)
 	if !ok {
 		return pb.Vote_VOTE_NOT_FOUND, 0, ErrTxNotFound
@@ -242,9 +267,9 @@ func (s *Shard) Prepare(txId string, isoLevel pb.IsolationLevel) (pb.Vote, uint6
 		return pb.Vote_VOTE_NOOP, 0, nil
 	}
 
-	// No writes and reads don't need CAS validation (not SER)
+	// No writes and reads don't need validation (not SER, or SER with locks already held)
 	// Can return EMPTY and skip commit phase
-	needsReadValidation := isoLevel == pb.IsolationLevel_ISOLATION_SER
+	needsReadValidation := buf.IsoLevel() == pb.IsolationLevel_ISOLATION_SER
 	if !hasWrites && !needsReadValidation {
 		s.cleanup(txId)
 		return pb.Vote_VOTE_NOOP, 0, nil
@@ -260,15 +285,18 @@ func (s *Shard) Prepare(txId string, isoLevel pb.IsolationLevel) (pb.Vote, uint6
 		return pb.Vote_VOTE_ABORT, 0, nil
 	}
 
-	// Acquire write locks with prepareTime
-	for _, key := range buf.WriteKeys() {
-		if err := s.lockMgr.AcquireWriteWithPrepareTime(txId, key, prepareTime); err != nil {
-			return abortAndCleanup()
+	// Acquire write locks with prepareTime (for non-SER, or for SER keys not yet locked)
+	// For SER, write locks are already acquired during TxWrite/TxDelete
+	if buf.IsoLevel() != pb.IsolationLevel_ISOLATION_SER {
+		for _, key := range buf.WriteKeys() {
+			if err := s.lockMgr.AcquireWriteWithPrepareTime(txId, key, prepareTime); err != nil {
+				return abortAndCleanup()
+			}
 		}
 	}
 
 	// CAS Validation for writes (SI and SER)
-	if isoLevel == pb.IsolationLevel_ISOLATION_SI || isoLevel == pb.IsolationLevel_ISOLATION_SER {
+	if buf.IsoLevel() == pb.IsolationLevel_ISOLATION_SI || buf.IsoLevel() == pb.IsolationLevel_ISOLATION_SER {
 		for _, op := range buf.WriteOps() {
 			_, currentVersion, _, err := s.store.GetLatest(op.Key)
 			if err != nil {
@@ -283,24 +311,8 @@ func (s *Shard) Prepare(txId string, isoLevel pb.IsolationLevel) (pb.Vote, uint6
 		}
 	}
 
-	// CAS Validation for reads (SER only)
-	if isoLevel == pb.IsolationLevel_ISOLATION_SER {
-		for _, r := range buf.ReadRecords() {
-			_, currentVersion, _, err := s.store.GetLatest(r.Key)
-			if err != nil {
-				if r.Found {
-					return abortAndCleanup()
-				}
-			} else {
-				if !r.Found {
-					return abortAndCleanup()
-				}
-				if currentVersion != r.Version {
-					return abortAndCleanup()
-				}
-			}
-		}
-	}
+	// CAS Validation for reads is NOT needed for SER (locks already held)
+	// This validation was only needed for optimistic locking approach
 
 	// Pre-write pending data to MVCC store
 	// Use prepareTime as the temporary version (will be updated to commitTime on commit)
@@ -356,6 +368,7 @@ func (s *Shard) Commit(txId string, commitTime uint64) error {
 // It performs validation, writes data directly to the MVCC store (not pending),
 // and commits in a single atomic operation.
 // Returns the commit time on success, or an error if validation fails.
+// For SER isolation level, locks are already acquired during read/write operations.
 func (s *Shard) QuickCommit(txId string, isoLevel pb.IsolationLevel) (uint64, error) {
 	buf, ok := s.bufferMgr.Get(txId)
 	if !ok {
@@ -371,7 +384,7 @@ func (s *Shard) QuickCommit(txId string, isoLevel pb.IsolationLevel) (uint64, er
 		return 0, nil
 	}
 
-	// No writes and reads don't need CAS validation (not SER)
+	// No writes and reads don't need validation (not SER, or SER with locks already held)
 	needsReadValidation := isoLevel == pb.IsolationLevel_ISOLATION_SER
 	if !hasWrites && !needsReadValidation {
 		s.cleanup(txId)
@@ -390,14 +403,17 @@ func (s *Shard) QuickCommit(txId string, isoLevel pb.IsolationLevel) (uint64, er
 	}
 
 	// Acquire write locks (no need for prepareTime since we commit immediately)
-	for _, key := range buf.WriteKeys() {
-		if err := s.lockMgr.AcquireWrite(txId, key); err != nil {
-			return abortAndCleanup()
+	// For SER, write locks are already acquired during TxWrite/TxDelete
+	if buf.IsoLevel() != pb.IsolationLevel_ISOLATION_SER {
+		for _, key := range buf.WriteKeys() {
+			if err := s.lockMgr.AcquireWrite(txId, key); err != nil {
+				return abortAndCleanup()
+			}
 		}
 	}
 
 	// CAS Validation for writes (SI and SER)
-	if isoLevel == pb.IsolationLevel_ISOLATION_SI || isoLevel == pb.IsolationLevel_ISOLATION_SER {
+	if buf.IsoLevel() == pb.IsolationLevel_ISOLATION_SI || buf.IsoLevel() == pb.IsolationLevel_ISOLATION_SER {
 		for _, op := range buf.WriteOps() {
 			_, currentVersion, _, err := s.store.GetLatest(op.Key)
 			if err != nil {
@@ -412,24 +428,8 @@ func (s *Shard) QuickCommit(txId string, isoLevel pb.IsolationLevel) (uint64, er
 		}
 	}
 
-	// CAS Validation for reads (SER only)
-	if isoLevel == pb.IsolationLevel_ISOLATION_SER {
-		for _, r := range buf.ReadRecords() {
-			_, currentVersion, _, err := s.store.GetLatest(r.Key)
-			if err != nil {
-				if r.Found {
-					return abortAndCleanup()
-				}
-			} else {
-				if !r.Found {
-					return abortAndCleanup()
-				}
-				if currentVersion != r.Version {
-					return abortAndCleanup()
-				}
-			}
-		}
-	}
+	// CAS Validation for reads is NOT needed for SER (locks already held)
+	// This validation was only needed for optimistic locking approach
 
 	// Write data directly to MVCC store (not pending)
 	for _, op := range buf.WriteOps() {

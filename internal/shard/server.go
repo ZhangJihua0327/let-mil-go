@@ -98,7 +98,7 @@ func (s *Server) TxDelete(ctx context.Context, req *pb.TxDeleteRequest) (*pb.TxD
 // For SI/SER isolation levels, validates write set with CAS check.
 // For SER isolation level, also validates read set with CAS check.
 func (s *Server) Prepare(ctx context.Context, req *pb.PrepareRequest) (*pb.PrepareResponse, error) {
-	vote, prepareTime, err := s.shard.Prepare(req.TxId, req.IsolationLevel)
+	vote, prepareTime, err := s.shard.Prepare(req.TxId)
 	if err != nil {
 		if errors.Is(err, component.ErrTxNotFound) {
 			return nil, status.Error(codes.NotFound, "transaction not found")
