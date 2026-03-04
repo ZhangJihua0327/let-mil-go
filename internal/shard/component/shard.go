@@ -45,7 +45,7 @@ func (s *Shard) ID() string {
 	return s.id
 }
 
-// GC performs garbage collection on versions older than minVersion.
+// o performs garbage collection on versions older than minVersion.
 func (s *Shard) GC(minVersion uint64) int {
 	return s.store.GC(minVersion)
 }
