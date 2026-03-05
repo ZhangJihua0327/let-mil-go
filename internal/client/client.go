@@ -3,64 +3,131 @@ package client
 import (
 	"context"
 	"fmt"
-	"strings"
+	"sync"
+	"sync/atomic"
 
 	"google.golang.org/grpc"
-	_ "google.golang.org/grpc/balancer/roundrobin" // added
 	"google.golang.org/grpc/credentials/insecure"
-	"google.golang.org/grpc/resolver"
 
 	"github.com/let-mil-go/proto/mulberrypb"
 	"github.com/let-mil-go/proto/shardpb"
 )
 
+// Client manages connections to multiple mulberry nodes with transaction affinity.
+// For new transactions, it uses round-robin to select a mulberry.
+// For ongoing transactions, all operations go to the same mulberry.
 type Client struct {
-	conn   *grpc.ClientConn
-	client mulberrypb.MulberryServiceClient
+	addresses []string
+	conns     []*grpc.ClientConn
+	clients   []mulberrypb.MulberryServiceClient
+
+	// round-robin counter for new transactions
+	counter uint32
+
+	// current transaction state
+	mu         sync.RWMutex
+	currentTx  string
+	currentIdx int // index of mulberry handling current transaction
 }
 
-// NewClient creates a new client connection to the mulberry service
+// NewClient creates a new client connection to multiple mulberry services
 func NewClient(addresses []string) (*Client, error) {
 	if len(addresses) == 0 {
 		return nil, fmt.Errorf("no addresses provided")
 	}
 
-	target := fmt.Sprintf("%s:///%s", mulberryScheme, strings.Join(addresses, ","))
+	conns := make([]*grpc.ClientConn, len(addresses))
+	clients := make([]mulberrypb.MulberryServiceClient, len(addresses))
 
-	conn, err := grpc.NewClient(
-		target,
-		grpc.WithTransportCredentials(insecure.NewCredentials()),
-		grpc.WithDefaultServiceConfig(`{"loadBalancingPolicy":"round_robin"}`),
-	)
-	if err != nil {
-		return nil, fmt.Errorf("failed to connect: %w", err)
+	for i, addr := range addresses {
+		conn, err := grpc.NewClient(
+			addr,
+			grpc.WithTransportCredentials(insecure.NewCredentials()),
+		)
+		if err != nil {
+			// Close already created connections
+			for j := 0; j < i; j++ {
+				conns[j].Close()
+			}
+			return nil, fmt.Errorf("failed to connect to %s: %w", addr, err)
+		}
+		conns[i] = conn
+		clients[i] = mulberrypb.NewMulberryServiceClient(conn)
 	}
 
 	return &Client{
-		conn:   conn,
-		client: mulberrypb.NewMulberryServiceClient(conn),
+		addresses:  addresses,
+		conns:      conns,
+		clients:    clients,
+		currentIdx: -1, // no active transaction
 	}, nil
 }
 
-// Close closes the connection
+// Close closes all connections
 func (c *Client) Close() error {
-	return c.conn.Close()
+	for _, conn := range c.conns {
+		if conn != nil {
+			conn.Close()
+		}
+	}
+	return nil
 }
 
-// StartTransaction starts a new transaction
+// getClient returns the appropriate mulberry client based on transaction state
+// For new transactions: uses round-robin to select a mulberry
+// For ongoing transactions: returns the same mulberry used for start
+func (c *Client) getClient(txID string) (mulberrypb.MulberryServiceClient, int, error) {
+	c.mu.RLock()
+	// If there's an active transaction and txID matches, use the same mulberry
+	if c.currentTx != "" && c.currentTx == txID && c.currentIdx >= 0 {
+		idx := c.currentIdx
+		c.mu.RUnlock()
+		return c.clients[idx], idx, nil
+	}
+	c.mu.RUnlock()
+
+	// For new transactions or unknown txID, use round-robin
+	if txID == "" {
+		// StartTransaction case - select new mulberry via round-robin
+		idx := int(atomic.AddUint32(&c.counter, 1) % uint32(len(c.clients)))
+		return c.clients[idx], idx, nil
+	}
+
+	// Transaction exists but not tracked locally - this shouldn't happen in normal flow
+	return nil, -1, fmt.Errorf("transaction %s not found in local session", txID)
+}
+
+// StartTransaction starts a new transaction using round-robin to select mulberry
 func (c *Client) StartTransaction(ctx context.Context, isolation shardpb.IsolationLevel) (string, error) {
-	resp, err := c.client.StartTransaction(ctx, &mulberrypb.StartTransactionRequest{
+	client, idx, err := c.getClient("")
+	if err != nil {
+		return "", err
+	}
+
+	resp, err := client.StartTransaction(ctx, &mulberrypb.StartTransactionRequest{
 		IsolationLevel: isolation,
 	})
 	if err != nil {
 		return "", err
 	}
+
+	// Record the transaction and its mulberry index
+	c.mu.Lock()
+	c.currentTx = resp.TxId
+	c.currentIdx = idx
+	c.mu.Unlock()
+
 	return resp.TxId, nil
 }
 
-// Read reads a value for a key within a transaction
+// Read reads a value for a key within a transaction (uses same mulberry as start)
 func (c *Client) Read(ctx context.Context, txID, key string) (string, bool, error) {
-	resp, err := c.client.Read(ctx, &mulberrypb.ReadRequest{
+	client, _, err := c.getClient(txID)
+	if err != nil {
+		return "", false, err
+	}
+
+	resp, err := client.Read(ctx, &mulberrypb.ReadRequest{
 		TxId: txID,
 		Key:  key,
 	})
@@ -70,9 +137,14 @@ func (c *Client) Read(ctx context.Context, txID, key string) (string, bool, erro
 	return resp.Value, resp.Found, nil
 }
 
-// Write writes a value for a key within a transaction
+// Write writes a value for a key within a transaction (uses same mulberry as start)
 func (c *Client) Write(ctx context.Context, txID, key, value string) error {
-	_, err := c.client.Write(ctx, &mulberrypb.WriteRequest{
+	client, _, err := c.getClient(txID)
+	if err != nil {
+		return err
+	}
+
+	_, err = client.Write(ctx, &mulberrypb.WriteRequest{
 		TxId:  txID,
 		Key:   key,
 		Value: value,
@@ -80,67 +152,60 @@ func (c *Client) Write(ctx context.Context, txID, key, value string) error {
 	return err
 }
 
-// Delete deletes a key within a transaction
+// Delete deletes a key within a transaction (uses same mulberry as start)
 func (c *Client) Delete(ctx context.Context, txID, key string) error {
-	_, err := c.client.Delete(ctx, &mulberrypb.DeleteRequest{
+	client, _, err := c.getClient(txID)
+	if err != nil {
+		return err
+	}
+
+	_, err = client.Delete(ctx, &mulberrypb.DeleteRequest{
 		TxId: txID,
 		Key:  key,
 	})
 	return err
 }
 
-// Commit commits the transaction
+// Commit commits the transaction and clears local transaction state
 func (c *Client) Commit(ctx context.Context, txID string) error {
-	_, err := c.client.Commit(ctx, &mulberrypb.CommitRequest{
-		TxId: txID,
-	})
-	return err
-}
-
-// Abort aborts the transaction
-func (c *Client) Abort(ctx context.Context, txID string) error {
-	_, err := c.client.Abort(ctx, &mulberrypb.AbortRequest{
-		TxId: txID,
-	})
-	return err
-}
-
-// Resolver implementation
-const mulberryScheme = "mulberry"
-
-func init() {
-	resolver.Register(&mulberryBuilder{})
-}
-
-type mulberryBuilder struct{}
-
-func (*mulberryBuilder) Build(target resolver.Target, cc resolver.ClientConn, opts resolver.BuildOptions) (resolver.Resolver, error) {
-	r := &mulberryResolver{
-		cc: cc,
-	}
-	r.start(target.Endpoint())
-	return r, nil
-}
-
-func (*mulberryBuilder) Scheme() string { return mulberryScheme }
-
-type mulberryResolver struct {
-	cc resolver.ClientConn
-}
-
-func (r *mulberryResolver) start(endpoint string) {
-	addrStrs := strings.Split(endpoint, ",")
-	var addrs []resolver.Address
-	for _, addr := range addrStrs {
-		if addr != "" {
-			addrs = append(addrs, resolver.Address{Addr: addr})
-		}
-	}
-	err := r.cc.UpdateState(resolver.State{Addresses: addrs})
+	client, _, err := c.getClient(txID)
 	if err != nil {
-		return
+		return err
 	}
+
+	_, err = client.Commit(ctx, &mulberrypb.CommitRequest{
+		TxId: txID,
+	})
+
+	// Clear transaction state regardless of commit success/failure
+	c.mu.Lock()
+	if c.currentTx == txID {
+		c.currentTx = ""
+		c.currentIdx = -1
+	}
+	c.mu.Unlock()
+
+	return err
 }
 
-func (*mulberryResolver) ResolveNow(o resolver.ResolveNowOptions) {}
-func (*mulberryResolver) Close()                                  {}
+// Abort aborts the transaction and clears local transaction state
+func (c *Client) Abort(ctx context.Context, txID string) error {
+	client, _, err := c.getClient(txID)
+	if err != nil {
+		return err
+	}
+
+	_, err = client.Abort(ctx, &mulberrypb.AbortRequest{
+		TxId: txID,
+	})
+
+	// Clear transaction state regardless of abort success/failure
+	c.mu.Lock()
+	if c.currentTx == txID {
+		c.currentTx = ""
+		c.currentIdx = -1
+	}
+	c.mu.Unlock()
+
+	return err
+}

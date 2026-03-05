@@ -42,7 +42,7 @@ func runInteractive(c *client.Client) {
 	reader := bufio.NewReader(os.Stdin)
 	var currentTxID string
 	fmt.Println("Mulberry Interactive Client")
-	fmt.Println("Commands: start, read <key>, write <key> <val>, delete <key>, commit, abort, q")
+	fmt.Println("Commands: start [RA|CC|PC|PSI|SI|SER], read <key>, write <key> <val>, delete <key>, commit, abort, q")
 
 	for {
 		if currentTxID == "" {
@@ -67,12 +67,31 @@ func runInteractive(c *client.Client) {
 			cancel()
 			return
 		case "start":
-			tid, err := c.StartTransaction(ctx, shardpb.IsolationLevel_ISOLATION_SI)
+			isolation := shardpb.IsolationLevel_ISOLATION_SI
+			if len(parts) > 1 {
+				switch strings.ToUpper(parts[1]) {
+				case "RA":
+					isolation = shardpb.IsolationLevel_ISOLATION_RA
+				case "CC":
+					isolation = shardpb.IsolationLevel_ISOLATION_CC
+				case "PC":
+					isolation = shardpb.IsolationLevel_ISOLATION_PC
+				case "PSI":
+					isolation = shardpb.IsolationLevel_ISOLATION_PSI
+				case "SI":
+					isolation = shardpb.IsolationLevel_ISOLATION_SI
+				case "SER":
+					isolation = shardpb.IsolationLevel_ISOLATION_SER
+				default:
+					fmt.Printf("Unknown isolation level: %s, using default SI\n", parts[1])
+				}
+			}
+			tid, err := c.StartTransaction(ctx, isolation)
 			if err != nil {
 				fmt.Printf("Error: %v\n", err)
 			} else {
 				currentTxID = tid
-				fmt.Printf("Transaction started: %s\n", tid)
+				fmt.Printf("Transaction started: %s (isolation: %s)\n", tid, isolation.String())
 			}
 		case "read":
 			if currentTxID == "" {
